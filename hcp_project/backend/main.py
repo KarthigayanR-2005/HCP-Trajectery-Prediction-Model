@@ -13,6 +13,8 @@ from hcp_project.data.womd_parser import WOMDParser
 from hcp_project.data.dataset_router import DatasetRouter, transform_to_ego
 from hcp_project.hcp.pruner import HierarchicalCombinatorialPruner
 from hcp_project.outputs.output_engine import TNT_RouteGraphEngine, HCPMapRenderer, MotionStateExplainer
+from hcp_project.eval.evaluate import HCPEvaluator
+from hcp_project.paper.paper_generator import IEEEPaperGenerator
 
 app = FastAPI(title="HCP + MTR Autonomous Driving Telemetry Dashboard")
 
