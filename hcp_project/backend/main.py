@@ -2,8 +2,11 @@ import os
 import json
 import time
 import asyncio
+import glob
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use('Agg')
 from fastapi import FastAPI, Response, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
