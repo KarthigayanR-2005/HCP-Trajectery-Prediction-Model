@@ -1,0 +1,24 @@
+[
+  {
+    "agent_id": 0,
+    "category": "ego_vehicle",
+    "speed_mps": 5.0,
+    "heading_deg": 0.0,
+    "accel_mps2": 0.0,
+    "turn_rate_radps": 0.0,
+    "ttc_seconds": 0.5,
+    "risk_level": "low",
+    "explanation": "Ego vehicle tracking target route trajectory."
+  },
+  {
+    "agent_id": 1,
+    "category": "vehicle",
+    "speed_mps": 1.0,
+    "heading_deg": 0.0,
+    "accel_mps2": 0.0,
+    "turn_rate_radps": 0.0,
+    "ttc_seconds": 4.0,
+    "risk_level": "medium",
+    "explanation": "Vehicle #1 moving at 1.0 m/s, lateral turn rate 0.00 rad/s. Medium risk close approach."
+  }
+]

@@ -1,0 +1,33 @@
+name: hcp_env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=2.2
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=11.8
+  - pip
+  - pip:
+      - nuscenes-devkit
+      - waymo-open-dataset-tf-2-12-0; sys_platform != "win32"
+      - shapely
+      - pyproj
+      - geopandas
+      - gtts
+      - pydub
+      - folium
+      - fastapi
+      - uvicorn
+      - networkx
+      - scikit-learn
+      - matplotlib
+      - pandas
+      - numpy
+      - scipy
+      - jinja2
+      - requests
+      - websockets
