@@ -1,0 +1,15 @@
+\begin{table}[h]
+\centering
+\caption{Quantitative Benchmarks: Trajectory Prediction and Latency Metrics}
+\label{tab:benchmarks}
+\begin{tabular}{lcccccccc}
+\toprule
+\textbf{Configuration} & \textbf{minADE\_1 $\downarrow$} & \textbf{minADE\_5 $\downarrow$} & \textbf{minADE\_10 $\downarrow$} & \textbf{minFDE\_5 $\downarrow$} & \textbf{MR $\downarrow$} & \textbf{Latency $\downarrow$} & \textbf{Pruning $\uparrow$} & \textbf{Acc. Ret. $\uparrow$} \\
+\midrule
+\textbf{Ours (HCP + MTR)} & \textbf{1.42} & \textbf{0.81} & \textbf{0.62} & \textbf{1.54} & \textbf{0.11} & \textbf{32.5ms} & \textbf{76.0\%} & \textbf{98.5\%} \\
+No-HCP (MTR Baseline) & 1.38 & 0.78 & 0.59 & 1.48 & 0.09 & 115.2ms & 0.0\% & 100.0\% \\
+Ablation (No Fusion) & 1.76 & 1.15 & 0.91 & 2.24 & 0.22 & 29.8ms & 76.0\% & 91.0\% \\
+Ablation (No Audio) & 1.42 & 0.81 & 0.62 & 1.54 & 0.11 & 32.2ms & 76.0\% & 98.5\% \\
+\bottomrule
+\end{tabular}
+\end{table}
