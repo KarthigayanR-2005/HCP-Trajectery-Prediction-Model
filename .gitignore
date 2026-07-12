@@ -30,3 +30,5 @@ node_modules/
 err.txt
 walkthrough.md.resolved
 *.resolved
+
+hcp_project/outputs/
