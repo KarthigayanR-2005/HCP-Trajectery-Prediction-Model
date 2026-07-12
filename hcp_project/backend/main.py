@@ -11,6 +11,7 @@ from fastapi import FastAPI, Response, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from shapely.geometry import LineString, Polygon
 
 from hcp_project.data.womd_parser import WOMDParser
 from hcp_project.data.dataset_router import DatasetRouter, transform_to_ego
@@ -24,7 +25,7 @@ app = FastAPI(title="HCP + MTR Autonomous Driving Telemetry Dashboard")
 # Enable CORS for frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows your React dev server to connect
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

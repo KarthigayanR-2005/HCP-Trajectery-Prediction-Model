@@ -25,3 +25,8 @@ hcp_project/outputs/*.png
 hcp_project/outputs/*.html
 hcp_project/outputs/*.json
 hcp_project/outputs/mtr_checkpoint.pth
+
+node_modules/
+err.txt
+walkthrough.md.resolved
+*.resolved
