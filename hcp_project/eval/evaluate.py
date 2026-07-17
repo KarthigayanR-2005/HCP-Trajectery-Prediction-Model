@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 import numpy as np
 
-class HCPEvaluator:
+class HCPEvaluator: 
     """
     Evaluator for Multi-Modal Autonomous Driving Trajectory Prediction.
     Benchmarks Ours (HCP + MTR) against baselines and computes
