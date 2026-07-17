@@ -1,5 +1,14 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Shield, Play, RotateCcw, Volume2, Award, FileText, Activity, Layers, Compass } from 'lucide-react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { Shield, Play, RotateCcw, Award, FileText, Activity, Layers, Compass } from 'lucide-react';
+import Map, { Source, Layer } from 'react-map-gl/maplibre';
+import 'maplibre-gl/dist/maplibre-gl.css';
+
+// Free dark basemap — no token or account needed
+const MAP_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json';
+
+// Default anchor point (San Francisco intersection) for converting local meter coords -> GPS
+const ANCHOR_LNG = -122.4194;
+const ANCHOR_LAT = 37.7749;
 
 interface AgentState {
   agent_id: number;
@@ -13,8 +22,30 @@ interface AgentState {
   explanation: string;
 }
 
+interface ScenarioData {
+  scenario_id: string;
+  agent_types: string[];
+  history: number[][][][];       // (N, T_hist, 6)
+  predictions: number[][][][][]; // (N, K, T_fut, 5)
+  confidences: number[][];       // (N, K)
+  map_polylines: number[][][];
+}
+
+/**
+ * Convert local meter offsets (dx, dy) from the ego origin into (lng, lat).
+ * Uses simple equirectangular approximation which is accurate at this zoom.
+ */
+function metersToLngLat(dx: number, dy: number, anchorLng: number, anchorLat: number): [number, number] {
+  const metersPerDegreeLat = 111_320;
+  const metersPerDegreeLng = 111_320 * Math.cos((anchorLat * Math.PI) / 180);
+  return [
+    anchorLng + dx / metersPerDegreeLng,
+    anchorLat + dy / metersPerDegreeLat,
+  ];
+}
+
 export default function App() {
-  const [tab, setTab] = useState<'dashboard' | 'viewer3d' | 'nlg' | 'paper'>('dashboard');
+  const [tab, setTab] = useState<'dashboard' | 'viewer3d' | 'nlg'>('dashboard');
   const [scenarioId, setScenarioId] = useState<string>('scenario_0');
   const [scenarios, setScenarios] = useState<string[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -33,7 +64,9 @@ export default function App() {
   
   // Active Agents and Explanations state
   const [agents, setAgents] = useState<AgentState[]>([]);
-  const [audioTranscript, setAudioTranscript] = useState("Select a scenario to trigger audio instructions.");
+  
+  // Full scenario data for map trajectories
+  const [scenarioData, setScenarioData] = useState<ScenarioData | null>(null);
   
   // Ref for ThreeJS
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -80,6 +113,44 @@ export default function App() {
           }
         ]);
       });
+
+    // Fetch full scenario data (predictions + history) for map rendering
+    fetch(`http://localhost:8000/scenario/${id}`)
+      .then(res => res.json())
+      .then((data: ScenarioData) => setScenarioData(data))
+      .catch(() => {
+        // Mock fallback with simple trajectories
+        const mockPreds: number[][][][][] = [];
+        // Ego agent
+        const egoModes: number[][][] = [];
+        const egoMode: number[][] = [];
+        for (let t = 0; t < 12; t++) {
+          egoMode.push([(t + 1) * 2.5, (t + 1) * 0.5, 5.0, 1.0, 0.2]);
+        }
+        egoModes.push(egoMode);
+        mockPreds.push(egoModes);
+
+        // Another agent
+        const agentModes: number[][][] = [];
+        const agentMode: number[][] = [];
+        for (let t = 0; t < 12; t++) {
+          agentMode.push([15 + (t + 1) * 1.0, -5 + (t + 1) * 0.3, 2.0, 0.6, -0.1]);
+        }
+        agentModes.push(agentMode);
+        mockPreds.push(agentModes);
+
+        setScenarioData({
+          scenario_id: id,
+          agent_types: ['ego_vehicle', 'vehicle'],
+          history: [
+            [[0, 0, 0, 0, 0, 0]].map(h => [h]),
+            [[15, -5, 0, 0, 0, 0]].map(h => [h]),
+          ] as any,
+          predictions: mockPreds,
+          confidences: [[1.0], [1.0]],
+          map_polylines: [],
+        });
+      });
   };
 
   const runHCP = () => {
@@ -100,10 +171,133 @@ export default function App() {
       });
   };
 
-  const playAudio = () => {
-    const audio = new Audio(`http://localhost:8000/audio/${scenarioId}`);
-    audio.play();
-    setAudioTranscript("Continue straight. Confidence score: 0.60. Alternative paths are available.");
+  // Build GeoJSON features for the Mapbox map
+  const { trajectoryGeoJSON, markersGeoJSON } = useMemo(() => {
+    const trajectoryFeatures: GeoJSON.Feature[] = [];
+    const markerFeatures: GeoJSON.Feature[] = [];
+
+    if (!scenarioData || !agents.length) {
+      return {
+        trajectoryGeoJSON: { type: 'FeatureCollection' as const, features: [] },
+        markersGeoJSON: { type: 'FeatureCollection' as const, features: [] },
+      };
+    }
+
+    const preds = scenarioData.predictions;
+    const confs = scenarioData.confidences;
+
+    for (let n = 0; n < preds.length && n < agents.length; n++) {
+      const agent = agents[n];
+      // Pick the highest-confidence mode
+      const modeConfs = confs[n];
+      let bestMode = 0;
+      let bestConf = -1;
+      for (let k = 0; k < modeConfs.length; k++) {
+        if (modeConfs[k] > bestConf) {
+          bestConf = modeConfs[k];
+          bestMode = k;
+        }
+      }
+
+      const traj = preds[n][bestMode]; // (T_fut, 5) -> [x, y, vx, vy, heading]
+      if (!traj || traj.length === 0) continue;
+
+      // Convert trajectory points to lng/lat
+      const coords: [number, number][] = traj.map((pt: number[]) =>
+        metersToLngLat(pt[0], pt[1], ANCHOR_LNG, ANCHOR_LAT)
+      );
+
+      // Determine color category
+      const isEgo = agent.agent_id === 0 || agent.category === 'ego_vehicle';
+      const isHighRisk = agent.risk_level === 'high';
+      const colorCategory = isEgo ? 'ego' : isHighRisk ? 'high_risk' : 'other';
+
+      // Line feature
+      trajectoryFeatures.push({
+        type: 'Feature',
+        properties: {
+          agentId: agent.agent_id,
+          colorCategory,
+          riskLevel: agent.risk_level,
+        },
+        geometry: {
+          type: 'LineString',
+          coordinates: coords,
+        },
+      });
+
+      // Marker at current position (first predicted point)
+      markerFeatures.push({
+        type: 'Feature',
+        properties: {
+          agentId: agent.agent_id,
+          colorCategory,
+          riskLevel: agent.risk_level,
+          label: isEgo ? 'EGO' : `#${agent.agent_id}`,
+        },
+        geometry: {
+          type: 'Point',
+          coordinates: coords[0],
+        },
+      });
+    }
+
+    return {
+      trajectoryGeoJSON: { type: 'FeatureCollection' as const, features: trajectoryFeatures },
+      markersGeoJSON: { type: 'FeatureCollection' as const, features: markerFeatures },
+    };
+  }, [scenarioData, agents]);
+
+  // Mapbox layer styles
+  const egoLineLayer = {
+    id: 'ego-trajectory',
+    type: 'line',
+    filter: ['==', ['get', 'colorCategory'], 'ego'],
+    paint: {
+      'line-color': '#1D9E75',
+      'line-width': 4,
+      'line-opacity': 0.9,
+    },
+  };
+
+  const otherLineLayer = {
+    id: 'other-trajectory',
+    type: 'line',
+    filter: ['==', ['get', 'colorCategory'], 'other'],
+    paint: {
+      'line-color': '#378ADD',
+      'line-width': 2.5,
+      'line-opacity': 0.8,
+    },
+  };
+
+  const highRiskLineLayer = {
+    id: 'high-risk-trajectory',
+    type: 'line',
+    filter: ['==', ['get', 'colorCategory'], 'high_risk'],
+    paint: {
+      'line-color': '#D85A30',
+      'line-width': 2.5,
+      'line-opacity': 0.9,
+    },
+  };
+
+  const markerLayer = {
+    id: 'agent-markers',
+    type: 'circle',
+    paint: {
+      'circle-radius': 7,
+      'circle-color': [
+        'match',
+        ['get', 'colorCategory'],
+        'ego', '#1D9E75',
+        'high_risk', '#D85A30',
+        '#378ADD', // default for 'other'
+      ],
+      'circle-stroke-width': 2,
+      'circle-stroke-color': '#0a0f14',
+      'circle-opacity': 1,
+    },
   };
 
   return (
@@ -118,7 +312,7 @@ export default function App() {
           <p className="text-xs text-slate-400 mt-1">Hierarchical Combinatorial Pruning + Motion Transformer Real-Time Control Center</p>
         </div>
         
-        <div class="flex items-center gap-4">
+        <div className="flex items-center gap-4">
           <div>
             <label className="text-[10px] text-slate-400 block mb-1">Select Scenario</label>
             <select 
@@ -158,12 +352,6 @@ export default function App() {
         >
           3. State Explainer
         </button>
-        <button 
-          onClick={() => setTab('paper')} 
-          className={`px-4 py-2 text-xs font-bold border-b-2 transition ${tab === 'paper' ? 'border-[#1D9E75] text-[#1D9E75]' : 'border-transparent text-slate-400 hover:text-white'}`}
-        >
-          4. IEEE Paper Builder
-        </button>
       </div>
 
       {/* Contents */}
@@ -188,28 +376,39 @@ export default function App() {
                 </div>
               ))}
             </div>
-            
-            {/* Audio Section */}
-            <div className="mt-4 pt-4 border-t border-slate-800 bg-slate-900/30 p-3 rounded-lg">
-              <span className="text-[9px] font-bold text-slate-400 uppercase block mb-1">TTS Voice Cues</span>
-              <p className="text-xs italic text-slate-300">"{audioTranscript}"</p>
-              <button onClick={playAudio} className="mt-3 bg-[#378ADD] hover:bg-sky-600 text-white text-xs font-bold px-3 py-1.5 rounded flex items-center gap-2 w-full justify-center transition">
-                <Volume2 size={14}/> Play Instruction
-              </button>
-            </div>
           </div>
 
-          {/* Center: Leaflet HD map mock */}
+          {/* Center: MapLibre HD map */}
           <div className="col-span-6 bg-slate-950/50 border border-slate-800 p-4 rounded-xl flex flex-col h-[580px]">
-            <h2 class="text-sm font-bold border-b border-slate-800 pb-2 mb-3 flex justify-between items-center">
+            <h2 className="text-sm font-bold border-b border-slate-800 pb-2 mb-3 flex justify-between items-center">
               <span>Ego-Centric BEV Crop (500m)</span>
               <span className="text-[10px] text-[#1D9E75] font-semibold flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-[#1D9E75] animate-pulse"></span> 10Hz Feed
               </span>
             </h2>
-            <div className="flex-grow rounded-lg overflow-hidden border border-slate-800 bg-[#0d131a] relative flex items-center justify-center">
-              {/* Display generated BEV map */}
-              <img className="w-full h-full object-contain" src={`http://localhost:8000/map/${scenarioId}`} alt="BEV map crop" />
+            <div className="flex-grow rounded-lg overflow-hidden border border-slate-800 bg-[#0d131a] relative">
+              <Map
+                initialViewState={{
+                  longitude: ANCHOR_LNG,
+                  latitude: ANCHOR_LAT,
+                  zoom: 16,
+                }}
+                style={{ width: '100%', height: '100%' }}
+                mapStyle={MAP_STYLE}
+                attributionControl={false}
+              >
+                {/* Trajectory lines */}
+                <Source id="trajectories" type="geojson" data={trajectoryGeoJSON}>
+                  <Layer {...egoLineLayer} />
+                  <Layer {...otherLineLayer} />
+                  <Layer {...highRiskLineLayer} />
+                </Source>
+
+                {/* Agent position markers */}
+                <Source id="markers" type="geojson" data={markersGeoJSON}>
+                  <Layer {...markerLayer} />
+                </Source>
+              </Map>
             </div>
             <div className="flex justify-between items-center mt-3 text-xs">
               <div className="flex gap-2">
@@ -295,7 +494,7 @@ export default function App() {
           <h2 className="text-sm font-bold border-b border-slate-800 pb-2 mb-4">State Explainer</h2>
           <div className="overflow-x-auto flex-grow">
             <table className="w-full text-left text-xs">
-              <thead class="bg-slate-900 text-slate-300 font-semibold border-b border-slate-800">
+              <thead className="bg-slate-900 text-slate-300 font-semibold border-b border-slate-800">
                 <tr>
                   <th className="p-3">Agent</th>
                   <th className="p-3">Type</th>
@@ -322,53 +521,6 @@ export default function App() {
                 ))}
               </tbody>
             </table>
-          </div>
-        </div>
-      )}
-
-      {tab === 'paper' && (
-        <div className="grid grid-cols-2 gap-6 flex-grow h-[580px]">
-          <div className="bg-slate-950/50 border border-slate-800 p-5 rounded-xl">
-            <h2 className="text-sm font-bold border-b border-slate-800 pb-2 mb-4">Main Results Table</h2>
-            <div className="overflow-x-auto text-xs font-mono">
-              <table className="w-full text-left">
-                <thead class="bg-slate-900">
-                  <tr>
-                    <th className="p-2">Configuration</th>
-                    <th className="p-2">minADE5</th>
-                    <th className="p-2">minFDE5</th>
-                    <th className="p-2">Latency</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr class="border-b border-slate-800">
-                    <td className="p-2 text-slate-300">Ours (HCP+MTR)</td>
-                    <td className="p-2">0.81m</td>
-                    <td className="p-2">1.54m</td>
-                    <td className="p-2 text-accent">32.5ms</td>
-                  </tr>
-                  <tr class="border-b border-slate-800">
-                    <td className="p-2 text-slate-400">Baseline MTR</td>
-                    <td className="p-2">0.78m</td>
-                    <td className="p-2">1.48m</td>
-                    <td className="p-2 text-slate-400">115.2ms</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-          <div className="bg-slate-950/50 border border-slate-800 p-5 rounded-xl flex flex-col">
-            <h2 className="text-sm font-bold border-b border-slate-800 pb-2 mb-4">LaTeX Draft</h2>
-            <div className="flex-grow bg-slate-900/50 p-4 rounded border border-slate-800 overflow-y-auto text-[10px] font-mono text-emerald-400">
-              <pre>{`\\documentclass[10pt,journal]{IEEEtran}
-\\begin{document}
-\\title{Hierarchical Combinatorial Pruning (HCP) for Motion Prediction}
-\\begin{abstract}
-Evaluated on nuScenes and WOMD datasets, our framework achieves a minADE5 of 0.81m, 
-retaining 98.5% of baseline accuracy while reducing inference latency by 71.8%.
-\\end{abstract}
-\\end{document}`}</pre>
-            </div>
           </div>
         </div>
       )}
