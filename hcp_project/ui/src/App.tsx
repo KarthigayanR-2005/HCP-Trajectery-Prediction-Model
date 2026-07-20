@@ -397,18 +397,16 @@ export default function App() {
                 mapStyle={MAP_STYLE}
                 attributionControl={false}
               >
-                {/* Trajectory lines */}
-                <Source id="trajectories" type="geojson" data={trajectoryGeoJSON}>
-                  <Layer {...egoLineLayer} />
-                  <Layer {...otherLineLayer} />
-                  <Layer {...highRiskLineLayer} />
-                </Source>
-
-                {/* Agent position markers */}
-                <Source id="markers" type="geojson" data={markersGeoJSON}>
-                  <Layer {...markerLayer} />
-                </Source>
+                {/* STAGING: Base real-world street map loads in isolation first.
+                    Trajectory overlays and agent markers are intentionally omitted
+                    until the team verifies the spatial environment is running correctly. */}
               </Map>
+              {/* Status banner overlay */}
+              <div className="absolute top-0 left-0 right-0 z-10 flex items-center justify-center pointer-events-none">
+                <div className="mt-3 px-5 py-2 bg-slate-950/70 backdrop-blur-md border border-emerald-500/20 rounded-full shadow-lg shadow-emerald-500/5">
+                  <span className="text-[11px] font-mono font-bold text-emerald-400 tracking-widest uppercase">🛰️ REAL-WORLD ENVIRONMENT MAP FEED</span>
+                </div>
+              </div>
             </div>
             <div className="flex justify-between items-center mt-3 text-xs">
               <div className="flex gap-2">

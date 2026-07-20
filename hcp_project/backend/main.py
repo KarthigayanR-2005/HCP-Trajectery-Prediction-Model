@@ -3,7 +3,7 @@ import json
 import time
 import asyncio
 import glob
-import numpy as np
+import numpy as np 
 import torch
 import matplotlib
 matplotlib.use('Agg')
@@ -18,7 +18,7 @@ from hcp_project.data.dataset_router import DatasetRouter, transform_to_ego
 from hcp_project.hcp.pruner import HierarchicalCombinatorialPruner
 from hcp_project.outputs.output_engine import TNT_RouteGraphEngine, HCPMapRenderer, MotionStateExplainer
 from hcp_project.eval.evaluate import HCPEvaluator
-from hcp_project.paper.paper_generator import IEEEPaperGenerator
+
 
 app = FastAPI(title="HCP + MTR Autonomous Driving Telemetry Dashboard")
 
@@ -255,15 +255,526 @@ def stream_scenario(s_id: str):
             
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-# Direct HTML landing page serving a beautiful, fully functional UI using CDNs
+# Direct HTML landing page — fully rewritten dashboard
 @app.get("/")
 def serve_dashboard():
-    # Embed the HTML code containing Leaflet, Three.js, Recharts, and Tone.js
     html_content = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HCP + MTR Control Room</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        darkbg: '#0a0f14',
+                        accent: '#1D9E75',
+                        secondary: '#378ADD',
+                        danger: '#D85A30',
+                        neon: '#00f2fe'
+                    }
+                }
+            }
+        }
+    </script>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=Outfit:wght@400;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <!-- Leaflet.js -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0a0f14;
+            color: #e2e8f0;
+        }
+        h1, h2, h3 {
+            font-family: 'Outfit', sans-serif;
+        }
+        .mono {
+            font-family: 'JetBrains Mono', monospace;
+        }
+        #leaflet-map {
+            height: 100%;
+            width: 100%;
+            background-color: #0d131a;
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 5px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #0f172a;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 3px;
+        }
+        /* Glassmorphism card base */
+        .glass-card {
+            background: rgba(15, 23, 42, 0.65);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(51, 65, 85, 0.5);
+            border-radius: 0.75rem;
+        }
+        /* Pulse animation for live dot */
+        @keyframes livePulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        .live-pulse {
+            animation: livePulse 1.5s ease-in-out infinite;
+        }
+        /* Hide Leaflet attribution for clean look */
+        .leaflet-control-attribution { display: none !important; }
+    </style>
+</head>
+<body class="p-5 bg-darkbg text-slate-100 overflow-x-hidden custom-scrollbar">
+
+    <!-- ═══════════════════ TOP HEADER ═══════════════════ -->
+    <header class="flex items-center justify-between pb-5 mb-5 border-b border-slate-800/60">
+        <div>
+            <h1 class="text-2xl font-extrabold text-accent flex items-center gap-3">
+                HCP + MTR Telemetry Dashboard
+                <span class="text-[10px] uppercase bg-emerald-900/30 text-accent border border-emerald-500/20 px-2.5 py-0.5 rounded-full font-bold tracking-wider">Live</span>
+            </h1>
+            <p class="text-slate-500 text-xs mt-1 tracking-wide">Hierarchical Combinatorial Pruning · Motion Transformer · Real-Time Control Center</p>
+        </div>
+        <div class="flex items-center gap-4">
+            <div>
+                <label class="text-[10px] text-slate-500 block mb-1 uppercase tracking-wider font-semibold">Scenario</label>
+                <select id="scenario-select" onchange="loadScenario(this.value)" class="bg-slate-900/80 border border-slate-700/60 rounded-lg px-3 py-1.5 text-xs font-semibold focus:outline-none focus:border-accent mono">
+                    <!-- Loaded dynamically -->
+                </select>
+            </div>
+            <button onclick="triggerHCPRun()" class="bg-accent hover:bg-emerald-600 text-darkbg font-bold px-5 py-2 rounded-lg transition text-xs flex items-center gap-2 shadow-lg shadow-emerald-500/10">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                Run HCP
+            </button>
+        </div>
+    </header>
+
+    <!-- ═══════════════════ NAVIGATION TABS (2 only) ═══════════════════ -->
+    <div class="flex gap-1 mb-5 border-b border-slate-800/40 pb-2">
+        <button onclick="switchTab('dashboard')" id="btn-tab-dashboard" class="px-5 py-2 border-b-2 border-accent text-accent font-semibold text-xs rounded-t-lg transition">1. Control Room BEV</button>
+        <button onclick="switchTab('nlg')" id="btn-tab-nlg" class="px-5 py-2 border-b-2 border-transparent text-slate-500 hover:text-white font-semibold text-xs rounded-t-lg transition">2. State Explainer</button>
+    </div>
+
+    <!-- ═══════════════════ MAIN DASHBOARD TAB ═══════════════════ -->
+    <div id="tab-dashboard" class="grid grid-cols-12 gap-5 tab-content">
+
+        <!-- ─── LEFT: Agent Intelligence Feed ─── -->
+        <div class="col-span-3 glass-card p-4 flex flex-col h-[640px]">
+            <h2 class="text-sm font-bold border-b border-slate-800/40 pb-2 mb-3 flex items-center justify-between">
+                <span class="flex items-center gap-2">
+                    <span class="w-1.5 h-1.5 rounded-full bg-accent live-pulse"></span>
+                    Agent Intelligence Feed
+                </span>
+                <span id="agent-count" class="text-[10px] bg-slate-800/60 px-2 py-0.5 rounded-full text-slate-400 mono">0 active</span>
+            </h2>
+            <div id="agent-list" class="flex-1 overflow-y-auto custom-scrollbar space-y-2.5 pr-1">
+                <!-- Loaded dynamically -->
+            </div>
+        </div>
+
+        <!-- ─── CENTER: Live HD Map ─── -->
+        <div class="col-span-6 glass-card p-4 flex flex-col h-[640px]">
+            <h2 class="text-sm font-bold border-b border-slate-800/40 pb-2 mb-3 flex items-center justify-between">
+                <span>Ego-Centric BEV Crop (500m)</span>
+                <span class="text-[10px] text-accent font-semibold flex items-center gap-1.5 mono">
+                    <span class="w-1.5 h-1.5 rounded-full bg-accent live-pulse"></span> 10Hz Feed
+                </span>
+            </h2>
+            <div class="relative flex-1 rounded-lg overflow-hidden border border-slate-800/40">
+                <div id="leaflet-map"></div>
+                <!-- HUD Status Overlay Banner -->
+                <div class="absolute top-0 left-0 right-0 z-[1000] flex items-center justify-center pointer-events-none">
+                    <div class="mt-3 px-5 py-1.5 bg-slate-950/75 backdrop-blur-lg border border-cyan-500/15 rounded-full shadow-lg shadow-cyan-500/5">
+                        <span class="text-[10px] mono font-bold text-cyan-400 tracking-[0.2em] uppercase live-pulse">🛰️ LIVE GEOGRAPHIC ENVIRONMENT STREAM</span>
+                    </div>
+                </div>
+            </div>
+            <!-- Control Bar -->
+            <div class="flex items-center justify-between mt-3">
+                <div class="flex items-center gap-2">
+                    <button onclick="togglePlayback()" id="btn-play" class="glass-card px-3 py-1.5 text-xs font-bold hover:border-accent/40 transition">Play Stream</button>
+                    <button onclick="resetPlayback()" class="glass-card px-3 py-1.5 text-xs font-bold hover:border-accent/40 transition">Reset</button>
+                </div>
+                <div class="flex items-center gap-2 text-[10px] mono text-slate-500">
+                    <span>Frame:</span>
+                    <span id="frame-counter" class="text-accent font-bold">0 / 12</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- ─── RIGHT: HCP Pruning Waterfall + Telemetry (PRESERVED) ─── -->
+        <div class="col-span-3 glass-card p-4 flex flex-col h-[640px] justify-between">
+            <div>
+                <h2 class="text-sm font-bold border-b border-slate-800/40 pb-2 mb-4">HCP Pruning Cascade</h2>
+                <div class="space-y-3.5">
+                    <div>
+                        <div class="flex justify-between text-xs mb-1">
+                            <span class="text-slate-400">Raw Candidates</span>
+                            <span class="mono font-bold text-slate-300">128 (100%)</span>
+                        </div>
+                        <div class="w-full bg-slate-900/60 h-3 rounded-full overflow-hidden">
+                            <div class="bg-slate-500 h-full w-[100%]"></div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-xs mb-1">
+                            <span class="text-slate-400 flex items-center gap-1.5">
+                                <span class="w-2 h-2 bg-slate-500 rounded-full"></span> Stage 1: KFF (Kinematic)
+                            </span>
+                            <span id="kff-stat" class="mono font-bold text-slate-300">74 (58%)</span>
+                        </div>
+                        <div class="w-full bg-slate-900/60 h-3 rounded-full overflow-hidden">
+                            <div id="kff-bar" class="bg-slate-500 h-full w-[58%] transition-all duration-500"></div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-xs mb-1">
+                            <span class="text-slate-400 flex items-center gap-1.5">
+                                <span class="w-2 h-2 bg-secondary rounded-full"></span> Stage 2: SRF (Spatial)
+                            </span>
+                            <span id="srf-stat" class="mono font-bold text-slate-300">31 (24%)</span>
+                        </div>
+                        <div class="w-full bg-slate-900/60 h-3 rounded-full overflow-hidden">
+                            <div id="srf-bar" class="bg-secondary h-full w-[24%] transition-all duration-500"></div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-xs mb-1">
+                            <span class="text-slate-400 flex items-center gap-1.5">
+                                <span class="w-2 h-2 bg-accent rounded-full"></span> Stage 3: SCF (Social)
+                            </span>
+                            <span id="scf-stat" class="mono font-bold text-accent">9 (7%)</span>
+                        </div>
+                        <div class="w-full bg-slate-900/60 h-3 rounded-full overflow-hidden">
+                            <div id="scf-bar" class="bg-accent h-full w-[7%] transition-all duration-500"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Latency Dial -->
+                <div class="mt-5 flex flex-col items-center glass-card p-4">
+                    <span class="text-[9px] text-slate-500 uppercase font-bold tracking-widest mb-2">Inference Latency</span>
+                    <div class="relative flex items-center justify-center w-24 h-24">
+                        <svg class="w-full h-full transform -rotate-90" viewBox="0 0 36 36">
+                            <path class="text-slate-800" stroke-width="3" stroke="currentColor" fill="none" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+                            <path id="dial-value" class="text-accent transition-all duration-500" stroke-dasharray="80, 100" stroke-width="3" stroke-linecap="round" stroke="currentColor" fill="none" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+                        </svg>
+                        <div class="absolute flex flex-col items-center">
+                            <span id="latency-ms" class="text-xl font-black mono text-white">32.5ms</span>
+                            <span class="text-[8px] uppercase tracking-widest text-slate-500 font-semibold">Real-Time</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Telemetry Summary Stats -->
+            <div class="grid grid-cols-2 gap-2.5 border-t border-slate-800/40 pt-3">
+                <div class="glass-card p-2.5 text-center">
+                    <span class="text-[9px] text-slate-500 uppercase block mb-0.5 tracking-wider font-semibold">Pruning Ratio</span>
+                    <span id="pruning-ratio" class="text-base font-black text-accent mono">76.0%</span>
+                </div>
+                <div class="glass-card p-2.5 text-center">
+                    <span class="text-[9px] text-slate-500 uppercase block mb-0.5 tracking-wider font-semibold">Latency Saved</span>
+                    <span id="latency-saved" class="text-base font-black text-secondary mono">71.8%</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══════════════════ STATE EXPLAINER TAB ═══════════════════ -->
+    <div id="tab-nlg" class="glass-card p-5 tab-content hidden">
+        <h2 class="text-sm font-bold border-b border-slate-800/40 pb-2 mb-4">Velocity & Direction Motion State Explainer</h2>
+        <div class="grid grid-cols-12 gap-5">
+            <div class="col-span-8 overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-slate-900/50 text-slate-400 font-semibold border-b border-slate-800/40">
+                        <tr>
+                            <th class="p-3">Agent</th>
+                            <th class="p-3">Type</th>
+                            <th class="p-3">Speed</th>
+                            <th class="p-3">Heading</th>
+                            <th class="p-3">TTC (s)</th>
+                            <th class="p-3">Risk</th>
+                            <th class="p-3">NLG Explanation</th>
+                        </tr>
+                    </thead>
+                    <tbody id="explainer-table-body" class="divide-y divide-slate-800/30">
+                        <!-- Loaded dynamically -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="col-span-4 glass-card p-4 flex flex-col items-center">
+                <h3 class="text-xs font-bold text-slate-400 mb-3 self-start">Direction Field Mapping</h3>
+                <div id="direction-field-box" class="w-full aspect-square border border-slate-800/40 bg-[#0a0f14] rounded-lg overflow-hidden relative flex items-center justify-center">
+                    <img id="direction-field-img" class="w-full h-full object-contain" src="" alt="Direction Field" />
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══════════════════ SCRIPTING ═══════════════════ -->
+    <script>
+        let LeafletMap = null;
+        let LeafletPaths = [];
+        let sseSource = null;
+        let currentScenarioId = "";
+
+        // ── Init ──
+        window.addEventListener('load', async () => {
+            try {
+                const res = await fetch('/scenarios');
+                const scenarios = await res.json();
+                const select = document.getElementById('scenario-select');
+                if (select && Array.isArray(scenarios)) {
+                    scenarios.forEach(s_id => {
+                        const opt = document.createElement('option');
+                        opt.value = s_id;
+                        opt.textContent = s_id;
+                        select.appendChild(opt);
+                    });
+                    if (scenarios.length > 0) {
+                        loadScenario(scenarios[0]);
+                    }
+                }
+            } catch (err) {
+                console.warn('Failed to load scenarios:', err);
+            }
+        });
+
+        // ── Tab Switching ──
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => el?.classList.add('hidden'));
+            const target = document.getElementById(`tab-${tabName}`);
+            if (target) target.classList.remove('hidden');
+
+            const tabs = ['dashboard', 'nlg'];
+            tabs.forEach(t => {
+                const btn = document.getElementById(`btn-tab-${t}`);
+                if (!btn) return;
+                if (t === tabName) {
+                    btn.classList.add('border-accent', 'text-accent');
+                    btn.classList.remove('border-transparent', 'text-slate-500');
+                } else {
+                    btn.classList.remove('border-accent', 'text-accent');
+                    btn.classList.add('border-transparent', 'text-slate-500');
+                }
+            });
+
+            if (tabName === 'dashboard' && LeafletMap) {
+                setTimeout(() => LeafletMap.invalidateSize(), 150);
+            }
+        }
+
+        // ── Load Scenario ──
+        async function loadScenario(s_id) {
+            currentScenarioId = s_id;
+            if (sseSource) { sseSource.close(); sseSource = null; }
+            const btnPlay = document.getElementById('btn-play');
+            if (btnPlay) btnPlay.textContent = "Play Stream";
+            const frameCounter = document.getElementById('frame-counter');
+            if (frameCounter) frameCounter.textContent = "0 / 12";
+
+            try {
+                const res = await fetch(`/scenario/${s_id}`);
+                const data = await res.json();
+                initLeafletMap(data);
+                loadAgentFeed(data);
+                loadNLGState(s_id);
+            } catch (err) {
+                console.warn('Scenario load failed:', err);
+            }
+        }
+
+        // ── Leaflet Map — Clean dark basemap, no overlays (staging) ──
+        function initLeafletMap(data) {
+            const lat = 1.290270;
+            const lon = 103.851959;
+
+            if (!LeafletMap) {
+                LeafletMap = L.map('leaflet-map', {
+                    attributionControl: false,
+                    zoomControl: true
+                }).setView([lat, lon], 17);
+
+                L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                    maxZoom: 20,
+                    subdomains: 'abcd'
+                }).addTo(LeafletMap);
+            }
+
+            // Clear any existing overlays
+            LeafletPaths.forEach(p => { try { LeafletMap.removeLayer(p); } catch(e) {} });
+            LeafletPaths = [];
+
+            // STAGING: Base real-world street map loads in isolation.
+            // Trajectory overlays omitted until team verifies spatial environment.
+            LeafletMap.setView([lat, lon], 17);
+        }
+
+        // ── Agent Intelligence Feed ──
+        function loadAgentFeed(data) {
+            const list = document.getElementById('agent-list');
+            if (!list) return;
+            list.innerHTML = "";
+            const countEl = document.getElementById('agent-count');
+            if (countEl && data?.history) {
+                countEl.textContent = `${data.history.length} active`;
+            }
+
+            (data?.history || []).forEach((hist, n) => {
+                if (!hist || hist.length === 0) return;
+                const lastPt = hist[hist.length - 1];
+                const vx = lastPt?.[2] || 0;
+                const vy = lastPt?.[3] || 0;
+                const speed = Math.sqrt(vx * vx + vy * vy).toFixed(1);
+                const type = data?.agent_types?.[n] || 'unknown';
+                const isEgo = n === 0;
+
+                const card = document.createElement('div');
+                card.className = `p-3 rounded-lg border text-xs flex justify-between items-center transition duration-200 hover:border-accent/40 ${
+                    isEgo ? 'bg-emerald-950/15 border-emerald-900/40' : 'bg-slate-900/30 border-slate-800/40'
+                }`;
+
+                const riskColor = isEgo ? 'text-accent' : 'text-slate-300';
+                card.innerHTML = `
+                    <div>
+                        <div class="font-bold flex items-center gap-1.5">
+                            <span class="${riskColor}">${isEgo ? 'Ego Vehicle' : 'Agent #' + n}</span>
+                            <span class="text-[8px] uppercase bg-slate-800/60 px-1.5 py-0.5 rounded text-slate-500 mono">${type}</span>
+                        </div>
+                        <div class="text-[10px] text-slate-500 mt-1">Speed: <span class="mono text-slate-300">${speed} m/s</span></div>
+                    </div>
+                    ${isEgo
+                        ? '<span class="text-accent text-[9px] border border-accent/30 bg-accent/5 px-2 py-0.5 rounded-full font-bold mono">SDC</span>'
+                        : '<span class="text-secondary text-[9px] border border-sky-900/30 bg-sky-950/10 px-2 py-0.5 rounded-full mono font-bold">#' + n + '</span>'
+                    }
+                `;
+                list.appendChild(card);
+            });
+        }
+
+        // ── NLG State Explainer ──
+        async function loadNLGState(s_id) {
+            try {
+                const res = await fetch(`/motion_states/${s_id}`);
+                const states = await res.json();
+                const tbody = document.getElementById('explainer-table-body');
+                if (!tbody || !Array.isArray(states)) return;
+                tbody.innerHTML = "";
+
+                states.forEach(s => {
+                    if (!s) return;
+                    const tr = document.createElement('tr');
+                    tr.className = "hover:bg-slate-900/20 text-xs";
+
+                    const riskBadge = s.risk_level === 'high'
+                        ? '<span class="px-2 py-0.5 rounded bg-red-950/30 text-red-400 border border-red-500/20 font-bold">HIGH</span>'
+                        : (s.risk_level === 'medium'
+                            ? '<span class="px-2 py-0.5 rounded bg-orange-950/30 text-orange-400 border border-orange-500/20 font-bold">MED</span>'
+                            : '<span class="px-2 py-0.5 rounded bg-emerald-950/20 text-emerald-400 border border-emerald-500/20 font-bold">LOW</span>');
+
+                    tr.innerHTML = `
+                        <td class="p-3 font-bold mono">#${s.agent_id ?? 'N/A'}</td>
+                        <td class="p-3 uppercase text-[10px] text-slate-500">${s.category ?? ''}</td>
+                        <td class="p-3 mono">${(s.speed_mps ?? 0).toFixed(1)} m/s</td>
+                        <td class="p-3 mono">${(s.heading_deg ?? 0).toFixed(0)}°</td>
+                        <td class="p-3 mono">${(s.ttc_seconds ?? -1) > 0 ? (s.ttc_seconds).toFixed(1) + 's' : 'N/A'}</td>
+                        <td class="p-3">${riskBadge}</td>
+                        <td class="p-3 text-slate-400 italic">${s.explanation ?? ''}</td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+
+                const dirImg = document.getElementById('direction-field-img');
+                if (dirImg) dirImg.src = `/map/${s_id}`;
+            } catch (err) {
+                console.warn('NLG load failed:', err);
+            }
+        }
+
+        // ── HCP Trigger ──
+        async function triggerHCPRun() {
+            try {
+                const res = await fetch(`/run_hcp/${currentScenarioId}`, { method: 'POST' });
+                const stats = await res.json();
+                if (!stats) return;
+
+                const update = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+                const updateWidth = (id, w) => { const el = document.getElementById(id); if (el) el.style.width = w; };
+
+                update('kff-stat', `${stats.kff_count} (${Math.round(stats.kff_count / stats.raw_count * 100)}%)`);
+                updateWidth('kff-bar', `${Math.round(stats.kff_count / stats.raw_count * 100)}%`);
+                update('srf-stat', `${stats.srf_count} (${Math.round(stats.srf_count / stats.raw_count * 100)}%)`);
+                updateWidth('srf-bar', `${Math.round(stats.srf_count / stats.raw_count * 100)}%`);
+                update('scf-stat', `${stats.scf_count} (${Math.round(stats.scf_count / stats.raw_count * 100)}%)`);
+                updateWidth('scf-bar', `${Math.round(stats.scf_count / stats.raw_count * 100)}%`);
+                update('latency-ms', `${stats.total_time_ms.toFixed(1)}ms`);
+                update('pruning-ratio', `${(stats.pruning_ratio * 100).toFixed(1)}%`);
+                update('latency-saved', `${stats.latency_reduction_pct.toFixed(1)}%`);
+
+                // Success flash on map
+                const mapEl = document.getElementById('leaflet-map');
+                if (mapEl) {
+                    const flash = document.createElement('div');
+                    flash.className = "absolute bottom-4 right-4 z-[1001] bg-accent/90 text-darkbg font-extrabold px-4 py-2 rounded-lg text-xs shadow-lg";
+                    flash.textContent = `HCP ✓ Pruned ${(stats.pruning_ratio * 100).toFixed(1)}%`;
+                    mapEl.appendChild(flash);
+                    setTimeout(() => flash.remove(), 2500);
+                }
+            } catch (err) {
+                console.warn('HCP run failed:', err);
+            }
+        }
+
+        // ── SSE Live Stream ──
+        function togglePlayback() {
+            const btn = document.getElementById('btn-play');
+            if (!btn) return;
+            if (btn.textContent === "Play Stream") {
+                btn.textContent = "Pause Stream";
+                sseSource = new EventSource(`/stream/${currentScenarioId}`);
+                sseSource.onmessage = function(event) {
+                    try {
+                        const data = JSON.parse(event.data);
+                        const fc = document.getElementById('frame-counter');
+                        if (fc) fc.textContent = `${(data?.step ?? 0) + 1} / 12`;
+                    } catch (e) {}
+                };
+                sseSource.onerror = function() {
+                    if (sseSource) sseSource.close();
+                    sseSource = null;
+                    btn.textContent = "Play Stream";
+                };
+            } else {
+                btn.textContent = "Play Stream";
+                if (sseSource) { sseSource.close(); sseSource = null; }
+            }
+        }
+
+        function resetPlayback() {
+            if (sseSource) { sseSource.close(); sseSource = null; }
+            const btn = document.getElementById('btn-play');
+            if (btn) btn.textContent = "Play Stream";
+            const fc = document.getElementById('frame-counter');
+            if (fc) fc.textContent = "0 / 12";
+        }
+    </script>
+</body>
+</html>
+"""
+    return Response(content=html_content, media_type="text/html")
+
+
+
     <title>HCP + MTR Control Room</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -358,26 +869,12 @@ def serve_dashboard():
         <!-- Left Panel: Agent Intelligence Feed -->
         <div class="col-span-3 bg-slate-950/80 border border-slate-800/60 rounded-xl p-5 flex flex-col h-[650px]">
             <h2 class="text-lg font-bold border-b border-slate-800 pb-2 mb-4 flex items-center justify-between">
-                <span>Agent Feed</span>
+                <span>Agent Intelligence Feed</span>
                 <span id="agent-count" class="text-xs bg-slate-800 px-2 py-0.5 rounded text-slate-400 font-mono">0 active</span>
             </h2>
             
             <div id="agent-list" class="flex-grow overflow-y-auto custom-scrollbar space-y-3">
                 <!-- Loaded dynamically -->
-            </div>
-
-            <!-- Audio Route Cues -->
-            <div class="mt-4 pt-4 border-t border-slate-800 bg-slate-900/30 p-3 rounded-lg">
-                <h3 class="text-xs font-bold text-slate-400 uppercase mb-2">TTS Audio Cue</h3>
-                <p id="tts-transcript" class="text-sm italic text-slate-300">"Select a scenario to trigger audio instructions."</p>
-                <div class="flex items-center gap-3 mt-3">
-                    <button onclick="playAudioCue()" class="bg-secondary hover:bg-sky-600 text-white rounded-full p-2 flex items-center justify-center transition">
-                        <svg class="w-4 h-4 fill-current" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                    </button>
-                    <div class="flex-grow bg-slate-800 h-2 rounded-full overflow-hidden">
-                        <div id="audio-wave" class="bg-accent h-full w-0 transition-all duration-300"></div>
-                    </div>
-                </div>
             </div>
         </div>
 
@@ -392,6 +889,12 @@ def serve_dashboard():
             
             <div class="relative flex-grow rounded-lg overflow-hidden border border-slate-800">
                 <div id="leaflet-map" class="w-full h-full"></div>
+                <!-- Status banner overlay -->
+                <div class="absolute top-0 left-0 right-0 z-[1000] flex items-center justify-center">
+                    <div class="mt-3 px-5 py-2 bg-slate-950/70 backdrop-blur-md border border-emerald-500/20 rounded-full shadow-lg shadow-emerald-500/5">
+                        <span class="text-[11px] font-mono font-bold text-emerald-400 tracking-widest uppercase">🛰️ REAL-WORLD ENVIRONMENT MAP FEED</span>
+                    </div>
+                </div>
             </div>
 
             <!-- Control Bar -->
@@ -537,34 +1040,7 @@ def serve_dashboard():
         </div>
     </div>
 
-    <!-- IEEE PAPER BUILDER TAB -->
-    <div id="tab-paper" class="grid grid-cols-2 gap-6 tab-content hidden">
-        <div class="bg-slate-950 border border-slate-800 rounded-xl p-5">
-            <h2 class="text-lg font-bold border-b border-slate-800 pb-2 mb-4">Live Evaluation Results Table</h2>
-            <div class="overflow-x-auto">
-                <table class="w-full text-left text-xs mono">
-                    <thead class="bg-slate-900 border-b border-slate-800">
-                        <tr>
-                            <th class="p-2">Configuration</th>
-                            <th class="p-2">minADE5</th>
-                            <th class="p-2">minFDE5</th>
-                            <th class="p-2">Latency</th>
-                            <th class="p-2">Pruning</th>
-                        </tr>
-                    </thead>
-                    <tbody id="paper-table-body">
-                        <!-- Loaded dynamically -->
-                    </tbody>
-                </table>
-            </div>
-        </div>
-        <div class="bg-slate-950 border border-slate-800 rounded-xl p-5 flex flex-col h-[500px]">
-            <h2 class="text-lg font-bold border-b border-slate-800 pb-2 mb-4">LaTeX Draft Preview</h2>
-            <div class="flex-grow bg-slate-900/50 p-4 rounded border border-slate-800 overflow-y-auto custom-scrollbar">
-                <pre id="latex-preview" class="text-[11px] font-mono text-emerald-400 whitespace-pre-wrap">Loading LaTeX draft...</pre>
-            </div>
-        </div>
-    </div>
+
 
     <!-- Scripting for UI logics -->
     <script>
@@ -662,8 +1138,8 @@ def serve_dashboard():
             const lon = 103.851959;
             
             if (!LeafletMap) {
-                LeafletMap = L.map('leaflet-map').setView([lat, lon], 18);
-                // Dark matter tile map
+                LeafletMap = L.map('leaflet-map', {attributionControl: false}).setView([lat, lon], 17);
+                // Dark matter tile map — premium real-world basemap (no API key required)
                 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
                     maxZoom: 20
                 }).addTo(LeafletMap);
@@ -672,42 +1148,17 @@ def serve_dashboard():
             // Clear existing map paths
             LeafletPaths.forEach(p => LeafletMap.removeLayer(p));
             LeafletPaths = [];
-            
-            // Draw map lanes
-            data.map_polylines.forEach(poly => {
-                // Convert poly offsets to lat/lon offsets
-                const pts = poly.map(pt => [lat + pt[1]*0.000009, lon + pt[0]*0.000009]);
-                const type = poly[0][2];
-                let color = '#4b5a6c';
-                let dash = null;
-                
-                if (type === 2.0) {
-                    color = '#ffd166';
-                    dash = '5, 5';
-                }
-                
-                const path = L.polyline(pts, {color: color, weight: 2, dashArray: dash}).addTo(LeafletMap);
-                LeafletPaths.push(path);
-            });
-            
-            // Draw Ego
             if (LeafletEgoMarker) {
                 LeafletMap.removeLayer(LeafletEgoMarker);
-            }
-            LeafletEgoMarker = L.marker([lat, lon]).addTo(LeafletMap).bindPopup("Ego Vehicle (t=0)");
-            
-            // Draw top MTR predictions as paths on Leaflet
-            // Ego predictions are at index 0
-            const colors = ['#1D9E75', '#378ADD', '#D85A30'];
-            for (let k = 0; k < 3; k++) {
-                const traj = data.predictions[0][k];
-                const pts = traj.map(pt => [lat + pt[1]*0.000009, lon + pt[0]*0.000009]);
-                const path = L.polyline(pts, {color: colors[k], weight: 4 - k, dashArray: k === 0 ? null : '3, 4'}).addTo(LeafletMap);
-                LeafletPaths.push(path);
+                LeafletEgoMarker = null;
             }
             
-            // Center map around ego
-            LeafletMap.setView([lat, lon], 18);
+            // STAGING: Base real-world street map loads in isolation first.
+            // Trajectory overlays and agent markers are intentionally omitted
+            // until the team verifies the spatial environment is running correctly.
+            
+            // Center map
+            LeafletMap.setView([lat, lon], 17);
         }
 
         function loadAgentFeed(data) {
@@ -750,32 +1201,7 @@ def serve_dashboard():
             });
         }
 
-        async function playAudioCue(preloadOnly = false) {
-            if (audioObject) {
-                audioObject.pause();
-            }
-            
-            // Build gTTS stream URL
-            const url = `/audio/${currentScenarioId}`;
-            audioObject = new Audio(url);
-            
-            // Update transcript text dynamically based on route confidence
-            const res = await fetch(`/scenario/${currentScenarioId}`);
-            const data = await res.json();
-            const confidence = data.confidences[0][0]; // Ego best mode confidence
-            
-            let explanation = `Continue straight. Confidence score: ${confidence.toFixed(2)}. Alternative paths are available.`;
-            document.getElementById('tts-transcript').textContent = `"${explanation}"`;
-            
-            if (!preloadOnly) {
-                // Animate progress bar
-                document.getElementById('audio-wave').style.width = "100%";
-                audioObject.play();
-                setTimeout(() => {
-                    document.getElementById('audio-wave').style.width = "0%";
-                }, 3000);
-            }
-        }
+
 
         async function loadNLGState(s_id) {
             const res = await fetch(`/motion_states/${s_id}`);
@@ -834,40 +1260,7 @@ def serve_dashboard():
             setTimeout(() => statusNode.remove(), 2500);
         }
 
-        async function loadPaperBuilder() {
-            // Load live LaTeX table results
-            const res = await fetch('/metrics');
-            const data = await res.json();
-            
-            const tbody = document.getElementById('paper-table-body');
-            tbody.innerHTML = "";
-            
-            for (let config in data) {
-                const m = data[config];
-                const tr = document.createElement('tr');
-                tr.className = "border-b border-slate-800 hover:bg-slate-900/30";
-                tr.innerHTML = `
-                    <td class="p-2 font-semibold text-slate-300">${config}</td>
-                    <td class="p-2">${m.minADE5 ? m.minADE5.toFixed(2) : m.minADE_5.toFixed(2)}m</td>
-                    <td class="p-2">${m.minFDE5 ? m.minFDE5.toFixed(2) : m.minFDE_5.toFixed(2)}m</td>
-                    <td class="p-2 text-accent">${m.latency_ms.toFixed(1)}ms</td>
-                    <td class="p-2 text-secondary">${m.pruning_ratio ? (m.pruning_ratio * 100).toFixed(1) : (m.pruning_ratio_pct).toFixed(1)}%</td>
-                `;
-                tbody.appendChild(tr);
-            }
-            
-            // Fetch LaTeX code preview
-            const texRes = await fetch('/scenario/' + currentScenarioId);
-            document.getElementById('latex-preview').textContent = `\\documentclass[10pt,journal]{IEEEtran}
-\\begin{document}
-\\title{HCP: Hierarchical Combinatorial Pruning for Motion Forecasting}
-\\begin{abstract}
-Evaluated on nuScenes and WOMD, our framework achieves a minADE5 of 0.81m, 
-retaining 98.5% of baseline accuracy while reducing inference latency by 71.8% 
-(from 115.2ms to 32.5ms), ensuring real-time safety.
-\\end{abstract}
-\\end{document}`;
-        }
+
 
         // Three.js 3D Viewer Logic
         function init3DViewer() {
@@ -1014,12 +1407,8 @@ retaining 98.5% of baseline accuracy while reducing inference latency by 71.8%
 
 if __name__ == "__main__":
     import uvicorn
-    # Generate the initial paper LaTeX draft
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     evaluator = HCPEvaluator(OUTPUT_DIR)
     evaluator.run_benchmarks()
-    
-    paper_gen = IEEEPaperGenerator(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "paper"), OUTPUT_DIR)
-    paper_gen.generate_latex_document()
     
     uvicorn.run(app, host="0.0.0.0", port=8000)
