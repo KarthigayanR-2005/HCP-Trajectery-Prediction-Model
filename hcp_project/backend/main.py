@@ -333,6 +333,7 @@ def serve_dashboard():
         .leaflet-control-attribution { display: none !important; }
     </style>
 </head>
+
 <body class="p-5 bg-darkbg text-slate-100 overflow-x-hidden custom-scrollbar">
 
     <!-- ═══════════════════ TOP HEADER ═══════════════════ -->
