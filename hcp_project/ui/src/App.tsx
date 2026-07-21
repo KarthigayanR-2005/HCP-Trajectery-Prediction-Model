@@ -1,15 +1,18 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Shield, Play, RotateCcw, Award, FileText, Activity, Layers, Compass } from 'lucide-react';
-import Map, { Source, Layer } from 'react-map-gl/maplibre';
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Activity, Layers, Compass, Box, Zap, Shield,
+  Radio, ChevronRight, Gauge, Timer, TrendingDown,
+} from 'lucide-react';
+import Map from 'react-map-gl/maplibre';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
-// Free dark basemap — no token or account needed
+/* ═══════════════════ CONSTANTS ═══════════════════ */
 const MAP_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json';
-
-// Default anchor point (San Francisco intersection) for converting local meter coords -> GPS
 const ANCHOR_LNG = -122.4194;
 const ANCHOR_LAT = 37.7749;
+const API = 'http://localhost:8000';
 
+/* ═══════════════════ TYPES ═══════════════════ */
 interface AgentState {
   agent_id: number;
   category: string;
@@ -22,506 +25,417 @@ interface AgentState {
   explanation: string;
 }
 
-interface ScenarioData {
-  scenario_id: string;
-  agent_types: string[];
-  history: number[][][][];       // (N, T_hist, 6)
-  predictions: number[][][][][]; // (N, K, T_fut, 5)
-  confidences: number[][];       // (N, K)
-  map_polylines: number[][][];
+interface HCPStats {
+  raw_count: number;
+  kff_count: number;
+  srf_count: number;
+  scf_count: number;
+  total_time_ms: number;
+  pruning_ratio: number;
+  latency_reduction_pct: number;
 }
 
-/**
- * Convert local meter offsets (dx, dy) from the ego origin into (lng, lat).
- * Uses simple equirectangular approximation which is accurate at this zoom.
- */
-function metersToLngLat(dx: number, dy: number, anchorLng: number, anchorLat: number): [number, number] {
-  const metersPerDegreeLat = 111_320;
-  const metersPerDegreeLng = 111_320 * Math.cos((anchorLat * Math.PI) / 180);
-  return [
-    anchorLng + dx / metersPerDegreeLng,
-    anchorLat + dy / metersPerDegreeLat,
-  ];
-}
+/* ═══════════════════ HELPERS ═══════════════════ */
+const riskColor = (level?: string) => {
+  switch (level?.toLowerCase()) {
+    case 'high': return { bg: 'bg-red-500/10', border: 'border-red-500/30', text: 'text-red-400', dot: 'bg-red-500' };
+    case 'medium': return { bg: 'bg-amber-500/10', border: 'border-amber-500/30', text: 'text-amber-400', dot: 'bg-amber-500' };
+    default: return { bg: 'bg-emerald-500/10', border: 'border-emerald-500/30', text: 'text-emerald-400', dot: 'bg-emerald-500' };
+  }
+};
 
+const pct = (val: number, total: number) => total > 0 ? Math.round((val / total) * 100) : 0;
+
+/* ═══════════════════ GLASS CARD COMPONENT ═══════════════════ */
+const Glass: React.FC<{ children: React.ReactNode; className?: string; style?: React.CSSProperties }> = ({ children, className = '', style }) => (
+  <div className={`glass ${className}`} style={style}>{children}</div>
+);
+
+/* ═══════════════════ PRUNING BAR ═══════════════════ */
+const PruneBar: React.FC<{ label: string; value: number; total: number; color: string; dotColor: string }> = ({
+  label, value, total, color, dotColor,
+}) => (
+  <div className="space-y-1.5">
+    <div className="flex justify-between text-[11px]">
+      <span className="text-slate-400 flex items-center gap-1.5">
+        <span className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
+        {label}
+      </span>
+      <span className="font-mono font-bold text-slate-300">{value} <span className="text-slate-500">({pct(value, total)}%)</span></span>
+    </div>
+    <div className="w-full h-1.5 rounded-full bg-white/[0.04] overflow-hidden">
+      <div
+        className={`h-full rounded-full transition-all duration-700 ease-out ${color}`}
+        style={{ width: `${pct(value, total)}%` }}
+      />
+    </div>
+  </div>
+);
+
+/* ═══════════════════════════════════════════════════
+   MAIN APP
+   ═══════════════════════════════════════════════════ */
 export default function App() {
   const [tab, setTab] = useState<'dashboard' | 'viewer3d' | 'nlg'>('dashboard');
-  const [scenarioId, setScenarioId] = useState<string>('scenario_0');
+  const [scenarioId, setScenarioId] = useState('scenario_0');
   const [scenarios, setScenarios] = useState<string[]>([]);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [step, setStep] = useState(0);
-  
-  // HCP Stats State
-  const [hcpStats, setHcpStats] = useState({
-    raw_count: 128,
-    kff_count: 74,
-    srf_count: 31,
-    scf_count: 9,
-    total_time_ms: 32.5,
-    pruning_ratio: 0.76,
-    latency_reduction_pct: 71.8
-  });
-  
-  // Active Agents and Explanations state
   const [agents, setAgents] = useState<AgentState[]>([]);
-  
-  // Full scenario data for map trajectories
-  const [scenarioData, setScenarioData] = useState<ScenarioData | null>(null);
-  
-  // Ref for ThreeJS
-  const canvasRef = useRef<HTMLDivElement>(null);
+  const [hcp, setHcp] = useState<HCPStats>({
+    raw_count: 128, kff_count: 74, srf_count: 31, scf_count: 9,
+    total_time_ms: 32.5, pruning_ratio: 0.76, latency_reduction_pct: 71.8,
+  });
+  const abortRef = useRef<AbortController | null>(null);
 
+  /* ── Init ── */
   useEffect(() => {
-    // Fetch scenario list
-    fetch('http://localhost:8000/scenarios')
-      .then(res => res.json())
-      .then(data => {
-        setScenarios(data);
-        if (data.length > 0) {
-          setScenarioId(data[0]);
-          loadScenario(data[0]);
-        }
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    fetch(`${API}/scenarios`, { signal: ctrl.signal })
+      .then(r => r.json())
+      .then((d: string[]) => {
+        if (!Array.isArray(d)) return;
+        setScenarios(d);
+        if (d.length > 0) { setScenarioId(d[0]); loadScenario(d[0]); }
       })
-      .catch(() => {
-        // Fallback for isolated client rendering
+      .catch(e => {
+        if (e?.name === 'AbortError') return;
         setScenarios(['scenario_0', 'scenario_1', 'scenario_2']);
         loadScenario('scenario_0');
       });
+    return () => ctrl.abort();
   }, []);
 
   const loadScenario = (id: string) => {
     setScenarioId(id);
-    setStep(0);
-    setIsPlaying(false);
-    
-    // Fetch motion states
-    fetch(`http://localhost:8000/motion_states/${id}`)
-      .then(res => res.json())
-      .then(data => setAgents(data))
-      .catch(() => {
-        // Mock fallback
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    fetch(`${API}/motion_states/${id}`, { signal: ctrl.signal })
+      .then(r => r.json())
+      .then(d => { if (Array.isArray(d)) setAgents(d); })
+      .catch(e => {
+        if (e?.name === 'AbortError') return;
         setAgents([
-          {
-            agent_id: 0, category: 'ego_vehicle', speed_mps: 12.4, heading_deg: 28.5,
-            accel_mps2: -2.1, turn_rate_radps: 0.0, ttc_seconds: -1,
-            risk_level: 'low', explanation: 'Ego vehicle tracking target route trajectory.'
-          },
-          {
-            agent_id: 1, category: 'vehicle', speed_mps: 8.5, heading_deg: 340.0,
-            accel_mps2: 0.5, turn_rate_radps: -0.15, ttc_seconds: 3.2,
-            risk_level: 'medium', explanation: 'Vehicle #1 moving at 8.5 m/s, decelerating at 0.5 m/s². Medium risk close approach.'
-          }
+          { agent_id: 0, category: 'ego_vehicle', speed_mps: 12.4, heading_deg: 28.5, accel_mps2: -2.1, turn_rate_radps: 0, ttc_seconds: -1, risk_level: 'low', explanation: 'Ego vehicle tracking target route trajectory.' },
+          { agent_id: 1, category: 'vehicle', speed_mps: 8.5, heading_deg: 340, accel_mps2: 0.5, turn_rate_radps: -0.15, ttc_seconds: 3.2, risk_level: 'medium', explanation: 'Vehicle #1 approaching. Medium risk.' },
+          { agent_id: 2, category: 'pedestrian', speed_mps: 1.2, heading_deg: 90, accel_mps2: 0, turn_rate_radps: 0, ttc_seconds: 8.1, risk_level: 'low', explanation: 'Pedestrian on sidewalk, safe distance.' },
         ]);
-      });
-
-    // Fetch full scenario data (predictions + history) for map rendering
-    fetch(`http://localhost:8000/scenario/${id}`)
-      .then(res => res.json())
-      .then((data: ScenarioData) => setScenarioData(data))
-      .catch(() => {
-        // Mock fallback with simple trajectories
-        const mockPreds: number[][][][][] = [];
-        // Ego agent
-        const egoModes: number[][][] = [];
-        const egoMode: number[][] = [];
-        for (let t = 0; t < 12; t++) {
-          egoMode.push([(t + 1) * 2.5, (t + 1) * 0.5, 5.0, 1.0, 0.2]);
-        }
-        egoModes.push(egoMode);
-        mockPreds.push(egoModes);
-
-        // Another agent
-        const agentModes: number[][][] = [];
-        const agentMode: number[][] = [];
-        for (let t = 0; t < 12; t++) {
-          agentMode.push([15 + (t + 1) * 1.0, -5 + (t + 1) * 0.3, 2.0, 0.6, -0.1]);
-        }
-        agentModes.push(agentMode);
-        mockPreds.push(agentModes);
-
-        setScenarioData({
-          scenario_id: id,
-          agent_types: ['ego_vehicle', 'vehicle'],
-          history: [
-            [[0, 0, 0, 0, 0, 0]].map(h => [h]),
-            [[15, -5, 0, 0, 0, 0]].map(h => [h]),
-          ] as any,
-          predictions: mockPreds,
-          confidences: [[1.0], [1.0]],
-          map_polylines: [],
-        });
       });
   };
 
   const runHCP = () => {
-    fetch(`http://localhost:8000/run_hcp/${scenarioId}`, { method: 'POST' })
-      .then(res => res.json())
-      .then(data => setHcpStats(data))
-      .catch(() => {
-        // Mock transition
-        setHcpStats({
-          raw_count: 128,
-          kff_count: 70,
-          srf_count: 28,
-          scf_count: 8,
-          total_time_ms: 31.8,
-          pruning_ratio: 0.78,
-          latency_reduction_pct: 72.4
-        });
-      });
+    fetch(`${API}/run_hcp/${scenarioId}`, { method: 'POST' })
+      .then(r => r.json())
+      .then(d => { if (d && typeof d === 'object') setHcp(d as HCPStats); })
+      .catch(() => setHcp({ raw_count: 128, kff_count: 70, srf_count: 28, scf_count: 8, total_time_ms: 31.8, pruning_ratio: 0.78, latency_reduction_pct: 72.4 }));
   };
 
-  // Build GeoJSON features for the Mapbox map
-  const { trajectoryGeoJSON, markersGeoJSON } = useMemo(() => {
-    const trajectoryFeatures: GeoJSON.Feature[] = [];
-    const markerFeatures: GeoJSON.Feature[] = [];
+  const tabs = [
+    { key: 'dashboard' as const, label: 'Control Room', icon: Compass },
+    { key: 'viewer3d' as const, label: '3D Scene', icon: Box },
+    { key: 'nlg' as const, label: 'Explainer', icon: Layers },
+  ];
 
-    if (!scenarioData || !agents.length) {
-      return {
-        trajectoryGeoJSON: { type: 'FeatureCollection' as const, features: [] },
-        markersGeoJSON: { type: 'FeatureCollection' as const, features: [] },
-      };
-    }
-
-    const preds = scenarioData.predictions;
-    const confs = scenarioData.confidences;
-
-    for (let n = 0; n < preds.length && n < agents.length; n++) {
-      const agent = agents[n];
-      // Pick the highest-confidence mode
-      const modeConfs = confs[n];
-      let bestMode = 0;
-      let bestConf = -1;
-      for (let k = 0; k < modeConfs.length; k++) {
-        if (modeConfs[k] > bestConf) {
-          bestConf = modeConfs[k];
-          bestMode = k;
-        }
-      }
-
-      const traj = preds[n][bestMode]; // (T_fut, 5) -> [x, y, vx, vy, heading]
-      if (!traj || traj.length === 0) continue;
-
-      // Convert trajectory points to lng/lat
-      const coords: [number, number][] = traj.map((pt: number[]) =>
-        metersToLngLat(pt[0], pt[1], ANCHOR_LNG, ANCHOR_LAT)
-      );
-
-      // Determine color category
-      const isEgo = agent.agent_id === 0 || agent.category === 'ego_vehicle';
-      const isHighRisk = agent.risk_level === 'high';
-      const colorCategory = isEgo ? 'ego' : isHighRisk ? 'high_risk' : 'other';
-
-      // Line feature
-      trajectoryFeatures.push({
-        type: 'Feature',
-        properties: {
-          agentId: agent.agent_id,
-          colorCategory,
-          riskLevel: agent.risk_level,
-        },
-        geometry: {
-          type: 'LineString',
-          coordinates: coords,
-        },
-      });
-
-      // Marker at current position (first predicted point)
-      markerFeatures.push({
-        type: 'Feature',
-        properties: {
-          agentId: agent.agent_id,
-          colorCategory,
-          riskLevel: agent.risk_level,
-          label: isEgo ? 'EGO' : `#${agent.agent_id}`,
-        },
-        geometry: {
-          type: 'Point',
-          coordinates: coords[0],
-        },
-      });
-    }
-
-    return {
-      trajectoryGeoJSON: { type: 'FeatureCollection' as const, features: trajectoryFeatures },
-      markersGeoJSON: { type: 'FeatureCollection' as const, features: markerFeatures },
-    };
-  }, [scenarioData, agents]);
-
-  // Mapbox layer styles
-  const egoLineLayer = {
-    id: 'ego-trajectory',
-    type: 'line',
-    filter: ['==', ['get', 'colorCategory'], 'ego'],
-    paint: {
-      'line-color': '#1D9E75',
-      'line-width': 4,
-      'line-opacity': 0.9,
-    },
-  };
-
-  const otherLineLayer = {
-    id: 'other-trajectory',
-    type: 'line',
-    filter: ['==', ['get', 'colorCategory'], 'other'],
-    paint: {
-      'line-color': '#378ADD',
-      'line-width': 2.5,
-      'line-opacity': 0.8,
-    },
-  };
-
-  const highRiskLineLayer = {
-    id: 'high-risk-trajectory',
-    type: 'line',
-    filter: ['==', ['get', 'colorCategory'], 'high_risk'],
-    paint: {
-      'line-color': '#D85A30',
-      'line-width': 2.5,
-      'line-opacity': 0.9,
-    },
-  };
-
-  const markerLayer = {
-    id: 'agent-markers',
-    type: 'circle',
-    paint: {
-      'circle-radius': 7,
-      'circle-color': [
-        'match',
-        ['get', 'colorCategory'],
-        'ego', '#1D9E75',
-        'high_risk', '#D85A30',
-        '#378ADD', // default for 'other'
-      ],
-      'circle-stroke-width': 2,
-      'circle-stroke-color': '#0a0f14',
-      'circle-opacity': 1,
-    },
-  };
-
+  /* ═══════════════════ RENDER ═══════════════════ */
   return (
-    <div className="min-h-screen bg-[#0a0f14] p-6 text-slate-100 flex flex-col font-sans">
-      {/* Header */}
-      <header className="flex justify-between items-center pb-5 mb-5 border-b border-slate-800">
-        <div>
-          <h1 className="text-2xl font-extrabold text-[#1D9E75] flex items-center gap-2">
-            HCP + MTR Telemetry Dashboard
-            <span className="text-[10px] uppercase bg-emerald-950/40 border border-emerald-500/30 text-emerald-400 px-2 py-0.5 rounded-full font-bold">React Node</span>
-          </h1>
-          <p className="text-xs text-slate-400 mt-1">Hierarchical Combinatorial Pruning + Motion Transformer Real-Time Control Center</p>
-        </div>
-        
+    <div className="min-h-screen bg-[#060a10] text-white flex flex-col">
+
+      {/* ═══════════ HEADER ═══════════ */}
+      <header className="px-6 pt-5 pb-4 flex items-center justify-between">
         <div className="flex items-center gap-4">
+          {/* Logo mark */}
+          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-500 to-emerald-500 flex items-center justify-center shadow-lg shadow-cyan-500/20">
+            <Shield className="w-5 h-5 text-white" />
+          </div>
           <div>
-            <label className="text-[10px] text-slate-400 block mb-1">Select Scenario</label>
-            <select 
-              value={scenarioId} 
-              onChange={e => loadScenario(e.target.value)} 
-              className="bg-slate-900 border border-slate-700 text-xs rounded px-3 py-1.5 focus:outline-none focus:border-[#1D9E75]"
+            <h1 className="text-lg font-bold tracking-tight flex items-center gap-2">
+              HCP + MTR
+              <span className="text-[9px] uppercase px-2 py-0.5 rounded-full font-bold tracking-widest bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                Live
+              </span>
+            </h1>
+            <p className="text-[11px] text-slate-500 tracking-wide">Hierarchical Combinatorial Pruning · Motion Transformer</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          {/* Scenario selector */}
+          <div className="glass px-3 py-2 flex items-center gap-2">
+            <span className="text-[9px] text-slate-500 uppercase tracking-wider font-semibold">Scenario</span>
+            <select
+              value={scenarioId}
+              onChange={e => loadScenario(e.target.value)}
+              className="bg-transparent text-xs font-mono font-bold text-white focus:outline-none cursor-pointer"
             >
-              {scenarios.map(s => <option key={s} value={s}>{s}</option>)}
+              {(scenarios ?? []).map(s => <option key={s} value={s} className="bg-[#0a0f14]">{s}</option>)}
             </select>
           </div>
-          <button 
-            onClick={runHCP} 
-            className="bg-[#1D9E75] hover:bg-emerald-600 text-[#0a0f14] font-bold text-xs px-4 py-2 rounded transition"
-          >
-            Trigger HCP
+          {/* HCP Trigger */}
+          <button onClick={runHCP} className="group relative px-5 py-2.5 rounded-xl font-bold text-xs overflow-hidden transition-all hover:shadow-lg hover:shadow-cyan-500/20">
+            <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 to-emerald-500 transition-opacity" />
+            <div className="absolute inset-0 bg-gradient-to-r from-cyan-400 to-emerald-400 opacity-0 group-hover:opacity-100 transition-opacity" />
+            <span className="relative flex items-center gap-2 text-[#060a10]">
+              <Zap className="w-3.5 h-3.5" />
+              Run HCP Pipeline
+            </span>
           </button>
         </div>
       </header>
 
-      {/* Tabs */}
-      <div className="flex gap-4 mb-6 border-b border-slate-800 pb-2">
-        <button 
-          onClick={() => setTab('dashboard')} 
-          className={`px-4 py-2 text-xs font-bold border-b-2 transition ${tab === 'dashboard' ? 'border-[#1D9E75] text-[#1D9E75]' : 'border-transparent text-slate-400 hover:text-white'}`}
-        >
-          1. Control Room BEV
-        </button>
-        <button 
-          onClick={() => setTab('viewer3d')} 
-          className={`px-4 py-2 text-xs font-bold border-b-2 transition ${tab === 'viewer3d' ? 'border-[#1D9E75] text-[#1D9E75]' : 'border-transparent text-slate-400 hover:text-white'}`}
-        >
-          2. 3D Scene Ribbon
-        </button>
-        <button 
-          onClick={() => setTab('nlg')} 
-          className={`px-4 py-2 text-xs font-bold border-b-2 transition ${tab === 'nlg' ? 'border-[#1D9E75] text-[#1D9E75]' : 'border-transparent text-slate-400 hover:text-white'}`}
-        >
-          3. State Explainer
-        </button>
-      </div>
+      {/* ═══════════ NAV TABS ═══════════ */}
+      <nav className="px-6 flex items-center gap-1 border-b border-white/[0.04]">
+        {tabs.map(t => {
+          const active = tab === t.key;
+          const Icon = t.icon;
+          return (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className={`relative px-4 py-3 text-xs font-semibold flex items-center gap-2 transition-colors ${
+                active ? 'text-cyan-400' : 'text-slate-500 hover:text-slate-300'
+              }`}
+            >
+              <Icon className="w-3.5 h-3.5" />
+              {t.label}
+              {active && <div className="absolute bottom-0 left-2 right-2 h-[2px] rounded-full bg-gradient-to-r from-cyan-500 to-emerald-500" />}
+            </button>
+          );
+        })}
+      </nav>
 
-      {/* Contents */}
-      {tab === 'dashboard' && (
-        <div className="grid grid-cols-12 gap-6 flex-grow">
-          {/* Left: Agent list */}
-          <div className="col-span-3 bg-slate-950/50 border border-slate-800 p-4 rounded-xl flex flex-col h-[580px]">
-            <h2 className="text-sm font-bold border-b border-slate-800 pb-2 mb-3">Agent Intelligence Feed</h2>
-            <div className="flex-grow overflow-y-auto space-y-3 pr-1">
-              {agents.map(a => (
-                <div key={a.agent_id} className={`p-3 border rounded-lg text-xs flex justify-between items-center ${a.agent_id === 0 ? 'bg-emerald-950/10 border-emerald-900/40' : 'bg-slate-900/30 border-slate-800'}`}>
-                  <div>
-                    <div className="font-bold flex items-center gap-1.5">
-                      <span>{a.agent_id === 0 ? 'Ego Vehicle' : `Agent #${a.agent_id}`}</span>
-                      <span className="text-[9px] bg-slate-800 text-slate-400 px-1 py-0.5 rounded uppercase">{a.category}</span>
-                    </div>
-                    <div className="text-[10px] text-slate-400 mt-1">Speed: <span className="font-mono">{a.speed_mps} m/s</span></div>
+      {/* ═══════════ CONTENT ═══════════ */}
+      <main className="flex-1 p-5 overflow-hidden">
+
+        {/* ─────── TAB: CONTROL ROOM ─────── */}
+        {tab === 'dashboard' && (
+          <div className="grid grid-cols-12 gap-4 h-full" style={{ minHeight: 'calc(100vh - 140px)' }}>
+
+            {/* LEFT — Agent Feed */}
+            <div className="col-span-3 flex flex-col gap-4">
+              <Glass className="p-4 flex-1 flex flex-col min-h-0">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-2">
+                    <Radio className="w-3.5 h-3.5 text-cyan-400" />
+                    Agent Feed
+                  </h2>
+                  <span className="text-[10px] font-mono text-slate-500">{agents?.length ?? 0} active</span>
+                </div>
+                <div className="flex-1 overflow-y-auto space-y-2 pr-1 min-h-0">
+                  {(agents ?? []).map(a => {
+                    const rc = riskColor(a?.risk_level);
+                    const isEgo = a?.agent_id === 0;
+                    return (
+                      <div
+                        key={a?.agent_id ?? Math.random()}
+                        className={`p-3 rounded-lg border transition-all duration-200 hover:border-cyan-500/30 hover:bg-cyan-500/[0.02] cursor-pointer ${
+                          isEgo ? 'border-emerald-500/20 bg-emerald-500/[0.04]' : 'border-white/[0.06] bg-white/[0.02]'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className={`text-xs font-bold ${isEgo ? 'text-emerald-400' : 'text-white'}`}>
+                            {isEgo ? '◉ Ego Vehicle' : `Agent #${a?.agent_id ?? '?'}`}
+                          </span>
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-md ${rc.bg} ${rc.border} ${rc.text} border`}>
+                            {(a?.risk_level ?? 'low').toUpperCase()}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-3 text-[10px] text-slate-500">
+                          <span className="font-mono">{a?.speed_mps ?? 0} m/s</span>
+                          <span>·</span>
+                          <span className="font-mono">{(a?.heading_deg ?? 0).toFixed(0)}°</span>
+                          <span>·</span>
+                          <span className="uppercase text-[8px] tracking-wider">{a?.category ?? 'unknown'}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </Glass>
+            </div>
+
+            {/* CENTER — Map */}
+            <div className="col-span-6 flex flex-col gap-4">
+              <Glass className="p-4 flex-1 flex flex-col min-h-0">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                    Ego-Centric BEV · 500m Crop
+                  </h2>
+                  <div className="flex items-center gap-1.5 text-[10px] font-mono text-emerald-400">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 hud-blink" />
+                    10Hz
                   </div>
-                  <span className={`px-2 py-0.5 rounded text-[9px] font-bold ${a.risk_level === 'high' ? 'bg-red-950 text-red-400 border border-red-900/50' : 'bg-slate-800 text-slate-400'}`}>
-                    {a.risk_level.toUpperCase()}
+                </div>
+
+                <div className="flex-1 rounded-xl overflow-hidden border border-white/[0.06] relative min-h-0">
+                  <Map
+                    initialViewState={{ longitude: ANCHOR_LNG, latitude: ANCHOR_LAT, zoom: 16 }}
+                    style={{ width: '100%', height: '100%' }}
+                    mapStyle={MAP_STYLE}
+                    attributionControl={false}
+                  />
+                  {/* HUD Overlay */}
+                  <div className="absolute top-0 left-0 right-0 z-10 flex justify-center pointer-events-none">
+                    <div className="mt-3 px-4 py-1.5 rounded-full bg-black/60 backdrop-blur-xl border border-cyan-500/10">
+                      <span className="text-[9px] font-mono font-bold text-cyan-400 tracking-[0.25em] uppercase hud-blink">
+                        🛰️ LIVE GEOGRAPHIC ENVIRONMENT STREAM
+                      </span>
+                    </div>
+                  </div>
+                  {/* Bottom gradient */}
+                  <div className="absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-t from-[#060a10] to-transparent pointer-events-none" />
+                </div>
+
+                {/* Controls */}
+                <div className="flex items-center justify-between mt-3">
+                  <div className="flex gap-2">
+                    {['Play', 'Reset'].map(label => (
+                      <button key={label} className="px-3 py-1.5 text-[10px] font-bold rounded-lg border border-white/[0.06] bg-white/[0.02] hover:border-cyan-500/30 hover:bg-cyan-500/[0.04] transition-all">
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <span className="text-[10px] font-mono text-slate-500">
+                    Frame <span className="text-emerald-400 font-bold">0</span>/12
                   </span>
+                </div>
+              </Glass>
+            </div>
+
+            {/* RIGHT — HCP Metrics */}
+            <div className="col-span-3 flex flex-col gap-4">
+              {/* Pruning Cascade */}
+              <Glass className="p-4 flex-1 flex flex-col min-h-0">
+                <h2 className="text-xs font-bold uppercase tracking-wider text-slate-300 mb-4 flex items-center gap-2">
+                  <TrendingDown className="w-3.5 h-3.5 text-cyan-400" />
+                  Pruning Cascade
+                </h2>
+                <div className="space-y-3 flex-1">
+                  <PruneBar label="Raw Candidates" value={128} total={128} color="bg-slate-500" dotColor="bg-slate-500" />
+                  <PruneBar label="KFF · Kinematic" value={hcp?.kff_count ?? 0} total={hcp?.raw_count || 1} color="bg-slate-400" dotColor="bg-slate-400" />
+                  <PruneBar label="SRF · Spatial" value={hcp?.srf_count ?? 0} total={hcp?.raw_count || 1} color="bg-sky-500" dotColor="bg-sky-500" />
+                  <PruneBar label="SCF · Social" value={hcp?.scf_count ?? 0} total={hcp?.raw_count || 1} color="bg-emerald-500" dotColor="bg-emerald-500" />
+                </div>
+
+                {/* Latency Ring */}
+                <div className="mt-4 pt-4 border-t border-white/[0.04] flex items-center gap-4">
+                  <div className="relative w-16 h-16 flex-shrink-0">
+                    <svg className="w-full h-full -rotate-90" viewBox="0 0 36 36">
+                      <circle cx="18" cy="18" r="15.9" fill="none" stroke="rgba(255,255,255,0.04)" strokeWidth="2.5" />
+                      <circle
+                        cx="18" cy="18" r="15.9" fill="none"
+                        stroke="url(#grad)" strokeWidth="2.5" strokeLinecap="round"
+                        strokeDasharray={`${Math.min(((hcp?.total_time_ms ?? 32.5) / 120) * 100, 100)}, 100`}
+                        className="transition-all duration-700"
+                      />
+                      <defs>
+                        <linearGradient id="grad" x1="0" y1="0" x2="1" y2="1">
+                          <stop offset="0%" stopColor="#06b6d4" />
+                          <stop offset="100%" stopColor="#10b981" />
+                        </linearGradient>
+                      </defs>
+                    </svg>
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <span className="text-sm font-black font-mono">{(hcp?.total_time_ms ?? 0).toFixed(0)}</span>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Latency</div>
+                    <div className="text-sm font-bold font-mono text-white">{(hcp?.total_time_ms ?? 0).toFixed(1)}ms</div>
+                  </div>
+                </div>
+              </Glass>
+
+              {/* Stats Row */}
+              <div className="grid grid-cols-2 gap-3">
+                <Glass className="p-3 text-center">
+                  <Gauge className="w-4 h-4 text-emerald-400 mx-auto mb-1" />
+                  <div className="text-lg font-black font-mono bg-gradient-to-r from-cyan-400 to-emerald-400 bg-clip-text text-transparent">
+                    {((hcp?.pruning_ratio ?? 0) * 100).toFixed(0)}%
+                  </div>
+                  <div className="text-[8px] text-slate-500 uppercase tracking-widest font-semibold mt-0.5">Pruned</div>
+                </Glass>
+                <Glass className="p-3 text-center">
+                  <Timer className="w-4 h-4 text-sky-400 mx-auto mb-1" />
+                  <div className="text-lg font-black font-mono bg-gradient-to-r from-sky-400 to-violet-400 bg-clip-text text-transparent">
+                    {(hcp?.latency_reduction_pct ?? 0).toFixed(0)}%
+                  </div>
+                  <div className="text-[8px] text-slate-500 uppercase tracking-widest font-semibold mt-0.5">Faster</div>
+                </Glass>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ─────── TAB: 3D SCENE ─────── */}
+        {tab === 'viewer3d' && (
+          <Glass className="p-6 flex flex-col items-center justify-center" style={{ minHeight: 'calc(100vh - 140px)' }}>
+            <div className="w-24 h-24 rounded-2xl bg-gradient-to-br from-cyan-500/20 to-violet-500/20 border border-white/[0.06] flex items-center justify-center mb-6">
+              <Box className="w-12 h-12 text-cyan-400/60" />
+            </div>
+            <h3 className="text-xl font-bold mb-2">3D Trajectory Ribbon Viewer</h3>
+            <p className="text-sm text-slate-400 max-w-lg text-center leading-relaxed mb-6">
+              Interactive Three.js scene with agent bounding boxes, multi-modal predicted
+              trajectory ribbons, and BEV grid overlays with orbit controls.
+            </p>
+            <div className="flex items-center gap-6 mb-6">
+              {[
+                { color: 'bg-emerald-500', label: 'Ego Route' },
+                { color: 'bg-sky-500', label: 'Alt Modes' },
+                { color: 'bg-orange-500', label: 'High Risk' },
+              ].map(c => (
+                <div key={c.label} className="flex items-center gap-2 text-[10px] text-slate-500">
+                  <span className={`w-2 h-2 rounded-sm ${c.color}`} />
+                  {c.label}
                 </div>
               ))}
             </div>
-          </div>
+            <p className="text-[10px] font-mono text-slate-600">
+              WebGL renderer available via FastAPI at localhost:8000
+            </p>
+          </Glass>
+        )}
 
-          {/* Center: MapLibre HD map */}
-          <div className="col-span-6 bg-slate-950/50 border border-slate-800 p-4 rounded-xl flex flex-col h-[580px]">
-            <h2 className="text-sm font-bold border-b border-slate-800 pb-2 mb-3 flex justify-between items-center">
-              <span>Ego-Centric BEV Crop (500m)</span>
-              <span className="text-[10px] text-[#1D9E75] font-semibold flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-[#1D9E75] animate-pulse"></span> 10Hz Feed
-              </span>
+        {/* ─────── TAB: STATE EXPLAINER ─────── */}
+        {tab === 'nlg' && (
+          <Glass className="p-5" style={{ minHeight: 'calc(100vh - 140px)' }}>
+            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-300 mb-4 flex items-center gap-2">
+              <Layers className="w-3.5 h-3.5 text-cyan-400" />
+              Motion State Explainer
             </h2>
-            <div className="flex-grow rounded-lg overflow-hidden border border-slate-800 bg-[#0d131a] relative">
-              <Map
-                initialViewState={{
-                  longitude: ANCHOR_LNG,
-                  latitude: ANCHOR_LAT,
-                  zoom: 16,
-                }}
-                style={{ width: '100%', height: '100%' }}
-                mapStyle={MAP_STYLE}
-                attributionControl={false}
-              >
-                {/* STAGING: Base real-world street map loads in isolation first.
-                    Trajectory overlays and agent markers are intentionally omitted
-                    until the team verifies the spatial environment is running correctly. */}
-              </Map>
-              {/* Status banner overlay */}
-              <div className="absolute top-0 left-0 right-0 z-10 flex items-center justify-center pointer-events-none">
-                <div className="mt-3 px-5 py-2 bg-slate-950/70 backdrop-blur-md border border-emerald-500/20 rounded-full shadow-lg shadow-emerald-500/5">
-                  <span className="text-[11px] font-mono font-bold text-emerald-400 tracking-widest uppercase">🛰️ REAL-WORLD ENVIRONMENT MAP FEED</span>
-                </div>
-              </div>
-            </div>
-            <div className="flex justify-between items-center mt-3 text-xs">
-              <div className="flex gap-2">
-                <button className="bg-slate-800 px-3 py-1 rounded hover:bg-slate-700">Play</button>
-                <button className="bg-slate-800 px-3 py-1 rounded hover:bg-slate-700">Reset</button>
-              </div>
-              <span className="text-slate-400">Time: <span className="text-[#1D9E75] font-bold">0.0s / 6.0s</span></span>
-            </div>
-          </div>
-
-          {/* Right: HCP Metrics */}
-          <div className="col-span-3 bg-slate-950/50 border border-slate-800 p-4 rounded-xl flex flex-col h-[580px] justify-between">
-            <div>
-              <h2 className="text-sm font-bold border-b border-slate-800 pb-2 mb-4">HCP Pruning Waterfall</h2>
-              <div className="space-y-4 text-xs">
-                <div>
-                  <div className="flex justify-between mb-1">
-                    <span className="text-slate-400">Raw Candidate Search Space</span>
-                    <span className="font-mono text-slate-200">128 (100%)</span>
-                  </div>
-                  <div className="w-full bg-slate-900 h-2.5 rounded-full overflow-hidden">
-                    <div className="bg-slate-400 h-full w-[100%]"></div>
-                  </div>
-                </div>
-                <div>
-                  <div className="flex justify-between mb-1">
-                    <span className="text-slate-400">Stage 1: KFF (Kinematic)</span>
-                    <span className="font-mono text-slate-200">{hcpStats.kff_count} ({Math.round(hcpStats.kff_count/hcpStats.raw_count*100)}%)</span>
-                  </div>
-                  <div className="w-full bg-slate-900 h-2.5 rounded-full overflow-hidden">
-                    <div className="bg-slate-500 h-full w-[58%]"></div>
-                  </div>
-                </div>
-                <div>
-                  <div className="flex justify-between mb-1">
-                    <span className="text-slate-400">Stage 2: SRF (Spatial)</span>
-                    <span className="font-mono text-slate-200">{hcpStats.srf_count} ({Math.round(hcpStats.srf_count/hcpStats.raw_count*100)}%)</span>
-                  </div>
-                  <div className="w-full bg-slate-900 h-2.5 rounded-full overflow-hidden">
-                    <div className="bg-[#378ADD] h-full w-[24%]"></div>
-                  </div>
-                </div>
-                <div>
-                  <div className="flex justify-between mb-1">
-                    <span className="text-[#1D9E75] font-bold">Stage 3: SCF (Social)</span>
-                    <span className="font-mono text-emerald-400 font-bold">{hcpStats.scf_count} ({Math.round(hcpStats.scf_count/hcpStats.raw_count*100)}%)</span>
-                  </div>
-                  <div className="w-full bg-slate-900 h-2.5 rounded-full overflow-hidden">
-                    <div className="bg-[#1D9E75] h-full w-[7%]"></div>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div className="border-t border-slate-800 pt-4 mt-6">
-              <span className="text-[10px] text-slate-400 uppercase font-bold tracking-wider block mb-2 text-center">Telemetry Metrics</span>
-              <div className="grid grid-cols-2 gap-2 text-center text-xs">
-                <div className="bg-slate-900/40 border border-slate-800 p-2.5 rounded-lg">
-                  <span className="text-[9px] text-slate-400 block mb-0.5">Inference Latency</span>
-                  <span className="text-sm font-black text-white font-mono">{hcpStats.total_time_ms}ms</span>
-                </div>
-                <div className="bg-slate-900/40 border border-slate-800 p-2.5 rounded-lg">
-                  <span className="text-[9px] text-slate-400 block mb-0.5">Latency Reduction</span>
-                  <span className="text-sm font-black text-[#1D9E75] font-mono">{hcpStats.latency_reduction_pct.toFixed(1)}%</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {tab === 'viewer3d' && (
-        <div className="bg-slate-950/50 border border-slate-800 p-5 rounded-xl flex flex-col h-[580px]">
-          <h2 className="text-sm font-bold border-b border-slate-800 pb-2 mb-3">3D Trajectory Ribbon Viewer</h2>
-          <div className="flex-grow rounded-lg overflow-hidden border border-slate-800 bg-[#0d131a] relative flex items-center justify-center">
-            <span className="text-xs text-slate-400">3D WebGL renderer compiles under Vite. In-browser demo preview serves via FastAPI landing page directly.</span>
-          </div>
-        </div>
-      )}
-
-      {tab === 'nlg' && (
-        <div className="bg-slate-950/50 border border-slate-800 p-5 rounded-xl flex flex-col h-[580px]">
-          <h2 className="text-sm font-bold border-b border-slate-800 pb-2 mb-4">State Explainer</h2>
-          <div className="overflow-x-auto flex-grow">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-slate-900 text-slate-300 font-semibold border-b border-slate-800">
-                <tr>
-                  <th className="p-3">Agent</th>
-                  <th className="p-3">Type</th>
-                  <th className="p-3">Speed</th>
-                  <th className="p-3">TTC (s)</th>
-                  <th className="p-3">Risk</th>
-                  <th className="p-3">NLG Explanation</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/50">
-                {agents.map(a => (
-                  <tr key={a.agent_id} className="hover:bg-slate-900/30">
-                    <td className="p-3 font-bold">#{a.agent_id}</td>
-                    <td className="p-3 text-slate-400">{a.category}</td>
-                    <td className="p-3 font-mono">{a.speed_mps} m/s</td>
-                    <td className="p-3 font-mono">{a.ttc_seconds > 0 ? a.ttc_seconds + 's' : 'N/A'}</td>
-                    <td className="p-3">
-                      <span className={`px-2 py-0.5 rounded font-bold ${a.risk_level === 'high' ? 'bg-red-950/40 text-red-500 border border-red-500/30' : 'bg-slate-900 text-slate-400'}`}>
-                        {a.risk_level.toUpperCase()}
-                      </span>
-                    </td>
-                    <td className="p-3 italic text-slate-300">{a.explanation}</td>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left">
+                <thead>
+                  <tr className="border-b border-white/[0.06]">
+                    {['Agent', 'Type', 'Speed', 'Heading', 'TTC', 'Risk', 'Explanation'].map(h => (
+                      <th key={h} className="p-3 text-[10px] uppercase tracking-wider text-slate-500 font-semibold">{h}</th>
+                    ))}
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
+                </thead>
+                <tbody>
+                  {(agents ?? []).map(a => {
+                    const rc = riskColor(a?.risk_level);
+                    return (
+                      <tr key={a?.agent_id ?? Math.random()} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
+                        <td className="p-3 text-xs font-bold font-mono">#{a?.agent_id ?? 'N/A'}</td>
+                        <td className="p-3 text-[10px] uppercase text-slate-500 tracking-wider">{a?.category ?? ''}</td>
+                        <td className="p-3 text-xs font-mono">{(a?.speed_mps ?? 0).toFixed(1)} m/s</td>
+                        <td className="p-3 text-xs font-mono">{(a?.heading_deg ?? 0).toFixed(0)}°</td>
+                        <td className="p-3 text-xs font-mono">{(a?.ttc_seconds ?? -1) > 0 ? `${a.ttc_seconds.toFixed(1)}s` : '—'}</td>
+                        <td className="p-3">
+                          <span className={`text-[9px] font-bold px-2 py-0.5 rounded-md ${rc.bg} ${rc.border} ${rc.text} border`}>
+                            {(a?.risk_level ?? 'low').toUpperCase()}
+                          </span>
+                        </td>
+                        <td className="p-3 text-xs text-slate-400 italic max-w-xs">{a?.explanation ?? ''}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Glass>
+        )}
+      </main>
     </div>
   );
 }
