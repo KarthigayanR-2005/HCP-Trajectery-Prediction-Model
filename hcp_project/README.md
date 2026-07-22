@@ -11,7 +11,7 @@ Dense candidates (N_agents × K_modes × T_steps)
                      ↓
       Stage 3: SCF (Social interactions GNN)
                      ↓
-               Sparse Set
+                Sparse Set
                      ↓
       MTR Decoder (GMM Forecasting)
 ```
@@ -32,7 +32,7 @@ python hcp_project/eval/evaluate.py
 # 3. Launch live telemetry control room dashboard
 python hcp_project/backend/main.py
 ```
-After launching the backend, open your browser and navigate to **`http://localhost:8000`** to view the live dashboard.
+After launching the backend, open **[http://localhost:8000](http://localhost:8000)** in your browser to view the live dashboard.
 
 ---
 
@@ -83,4 +83,4 @@ To run the complete server stack inside a container:
 ```bash
 docker-compose up --build
 ```
-Open **`http://localhost:8000`** to access the system.
+Open **[http://localhost:8000](http://localhost:8000)** to access the system.

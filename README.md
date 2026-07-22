@@ -18,15 +18,26 @@ Dense candidates (N_agents × K_modes × T_steps)
 
 ---
 
-## 🚀 Live Dashboard & Access
+## 🚀 Interactive Dashboard & Access
 
-- **Local Access Endpoint:** `http://localhost:8000` (Control Room Dashboard & SSE Stream)
-- **Deployment URL Target:** `https://hcp-trajectory-dashboard-gen-lang-client-0202786687.a.run.app`
-
-To launch the dashboard locally or test endpoints:
+### 1. Local Execution (Recommended)
+Run the application locally to access the interactive Control Room Dashboard & 10Hz SSE live telemetry feed:
 ```bash
 python hcp_project/backend/main.py
 ```
+Open **[http://localhost:8000](http://localhost:8000)** in your browser to access the control room interface.
+
+### 2. Cloud Deployment (Google Cloud Run)
+To deploy the dashboard to Google Cloud Run:
+```bash
+gcloud run deploy hcp-trajectory-dashboard \
+  --source hcp_project \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --memory 2Gi \
+  --port 8000
+```
+*Note: Ensure the Cloud Run API (`run.googleapis.com`) is enabled in your Google Cloud Console before deploying.*
 
 ---
 
@@ -44,7 +55,7 @@ python hcp_project/eval/evaluate.py
 # 3. Launch live telemetry control room dashboard
 python hcp_project/backend/main.py
 ```
-After launching the backend, open your browser and navigate to **`http://localhost:8000`** to view the live control room dashboard.
+After launching the backend, open **[http://localhost:8000](http://localhost:8000)** to view the live dashboard.
 
 ---
 
@@ -91,9 +102,8 @@ The control room dashboard provides three output modalities:
 
 ---
 
-## Docker & Cloud Deployment
+## Docker Execution
 
-### Local Docker Container
 To build and run using Docker:
 
 ```bash
@@ -101,16 +111,4 @@ cd hcp_project
 docker build -t hcp-trajectory-dashboard .
 docker run -p 8000:8000 hcp-trajectory-dashboard
 ```
-
-### Google Cloud Run Deployment
-To deploy to Google Cloud Run:
-
-```bash
-gcloud run deploy hcp-trajectory-dashboard \
-  --source hcp_project \
-  --region us-central1 \
-  --allow-unauthenticated \
-  --memory 2Gi \
-  --port 8000
-```
-*Note: Ensure the Cloud Run API (`run.googleapis.com`) is enabled in your GCP project console prior to deployment.*
+Open **[http://localhost:8000](http://localhost:8000)** in your browser.
