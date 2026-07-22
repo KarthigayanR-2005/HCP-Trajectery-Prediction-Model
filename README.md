@@ -1,6 +1,6 @@
 # HCP + MTR: Hierarchical Combinatorial Pruning for Multimodal Motion Transformers
 
-This repository contains the implementation of **Hierarchical Combinatorial Pruning (HCP)** integrated with a **Multimodal Motion Transformer (MTR)** backbone for real-time trajectory prediction in autonomous driving environments.
+This repository contains the official implementation of **Hierarchical Combinatorial Pruning (HCP)** integrated with a **Multimodal Motion Transformer (MTR)** backbone for real-time trajectory prediction in autonomous driving environments.
 
 ```
 Dense candidates (N_agents × K_modes × T_steps) 
@@ -14,6 +14,18 @@ Dense candidates (N_agents × K_modes × T_steps)
                Sparse Set
                      ↓
       MTR Decoder (GMM Forecasting)
+```
+
+---
+
+## 🚀 Live Dashboard & Access
+
+- **Local Access Endpoint:** `http://localhost:8000` (Control Room Dashboard & SSE Stream)
+- **Deployment URL Target:** `https://hcp-trajectory-dashboard-gen-lang-client-0202786687.a.run.app`
+
+To launch the dashboard locally or test endpoints:
+```bash
+python hcp_project/backend/main.py
 ```
 
 ---

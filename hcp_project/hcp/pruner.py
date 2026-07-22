@@ -1,9 +1,15 @@
 import torch
 import torch.nn as nn
 import time
-from hcp_project.hcp.kff import KinematicFeasibilityFilter
-from hcp_project.hcp.srf import SpatialReachabilityFilter
-from hcp_project.hcp.scf import SocialCompatibilityFilter
+try:
+    from hcp.kff import KinematicFeasibilityFilter
+    from hcp.srf import SpatialReachabilityFilter
+    from hcp.scf import SocialCompatibilityFilter
+except ModuleNotFoundError:
+    from hcp_project.hcp.kff import KinematicFeasibilityFilter
+    from hcp_project.hcp.srf import SpatialReachabilityFilter
+    from hcp_project.hcp.scf import SocialCompatibilityFilter
+
 
 class HierarchicalCombinatorialPruner(nn.Module):
     """

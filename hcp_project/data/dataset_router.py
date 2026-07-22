@@ -3,8 +3,13 @@ import tempfile
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from hcp_project.data.nuscenes_parser import NuScenesParser, NuScenesMapWrapper
-from hcp_project.data.womd_parser import WOMDParser
+try:
+    from data.nuscenes_parser import NuScenesParser, NuScenesMapWrapper
+    from data.womd_parser import WOMDParser
+except ModuleNotFoundError:
+    from hcp_project.data.nuscenes_parser import NuScenesParser, NuScenesMapWrapper
+    from hcp_project.data.womd_parser import WOMDParser
+
 
 
 # ---------------------------------------------------------------------------
