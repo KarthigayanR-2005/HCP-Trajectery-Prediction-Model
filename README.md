@@ -18,32 +18,17 @@ Dense candidates (N_agents × K_modes × T_steps)
 
 ---
 
-## 🚀 Interactive Dashboard & Access
+## 🌐 Public Live Interactive Web Demo
 
-### 1. Local Execution (Recommended)
-Run the application locally to access the interactive Control Room Dashboard & 10Hz SSE live telemetry feed:
-```bash
-python hcp_project/backend/main.py
-```
-Open **[http://localhost:8000](http://localhost:8000)** in your browser to access the control room interface.
+Click the link below to open and test the interactive Control Room Dashboard directly in your web browser without downloading any files:
 
-### 2. Cloud Deployment (Google Cloud Run)
-To deploy the dashboard to Google Cloud Run:
-```bash
-gcloud run deploy hcp-trajectory-dashboard \
-  --source hcp_project \
-  --region us-central1 \
-  --allow-unauthenticated \
-  --memory 2Gi \
-  --port 8000
-```
-*Note: Ensure the Cloud Run API (`run.googleapis.com`) is enabled in your Google Cloud Console before deploying.*
+👉 **[https://Rish-2006.github.io/HCP-Trajectery-Prediction-Model/](https://Rish-2006.github.io/HCP-Trajectery-Prediction-Model/)**
 
 ---
 
-## Quick Start
+## 🚀 Local Execution
 
-Execute the following commands from the root directory to generate datasets, evaluate models, and launch the interactive demo dashboard:
+Run the application locally to access the backend API and local control room interface:
 
 ```bash
 # 1. Unpack datasets and generate mock splits
@@ -55,7 +40,8 @@ python hcp_project/eval/evaluate.py
 # 3. Launch live telemetry control room dashboard
 python hcp_project/backend/main.py
 ```
-After launching the backend, open **[http://localhost:8000](http://localhost:8000)** to view the live dashboard.
+
+After launching the backend, open **[http://localhost:8000](http://localhost:8000)** in your browser.
 
 ---
 
@@ -63,6 +49,7 @@ After launching the backend, open **[http://localhost:8000](http://localhost:800
 
 ```
 .
+├── index.html             # Standalone live interactive web dashboard for GitHub Pages
 ├── hcp_project/
 │   ├── data/              # Data parsing and Unified Dataset Router
 │   ├── hcp/               # Hierarchical Combinatorial Pruning (KFF, SRF, SCF)
