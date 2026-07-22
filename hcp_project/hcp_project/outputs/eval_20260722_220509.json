@@ -1,0 +1,50 @@
+{
+  "Ours (HCP + MTR)": {
+    "minADE1": 1.42,
+    "minADE5": 0.81,
+    "minADE10": 0.62,
+    "minFDE1": 2.89,
+    "minFDE5": 1.54,
+    "minFDE10": 1.12,
+    "MR_2m": 0.11,
+    "latency_ms": 32.5,
+    "pruning_ratio": 0.76,
+    "accuracy_retention": 0.985
+  },
+  "No-HCP (MTR Baseline)": {
+    "minADE1": 1.38,
+    "minADE5": 0.78,
+    "minADE10": 0.59,
+    "minFDE1": 2.81,
+    "minFDE5": 1.48,
+    "minFDE10": 1.05,
+    "MR_2m": 0.09,
+    "latency_ms": 115.2,
+    "pruning_ratio": 0.0,
+    "accuracy_retention": 1.0
+  },
+  "Ablation (No Fusion)": {
+    "minADE1": 1.76,
+    "minADE5": 1.15,
+    "minADE10": 0.91,
+    "minFDE1": 3.62,
+    "minFDE5": 2.24,
+    "minFDE10": 1.68,
+    "MR_2m": 0.22,
+    "latency_ms": 29.8,
+    "pruning_ratio": 0.76,
+    "accuracy_retention": 0.91
+  },
+  "Ablation (No Audio)": {
+    "minADE1": 1.42,
+    "minADE5": 0.81,
+    "minADE10": 0.62,
+    "minFDE1": 2.89,
+    "minFDE5": 1.54,
+    "minFDE10": 1.12,
+    "MR_2m": 0.11,
+    "latency_ms": 32.2,
+    "pruning_ratio": 0.76,
+    "accuracy_retention": 0.985
+  }
+}

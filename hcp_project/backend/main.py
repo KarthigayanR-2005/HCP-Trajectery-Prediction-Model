@@ -3,6 +3,7 @@ import json
 import time
 import asyncio
 import glob
+import math
 import numpy as np 
 import torch
 import matplotlib
@@ -13,11 +14,43 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from shapely.geometry import LineString, Polygon
 
-from hcp_project.data.womd_parser import WOMDParser
-from hcp_project.data.dataset_router import DatasetRouter, transform_to_ego
-from hcp_project.hcp.pruner import HierarchicalCombinatorialPruner
-from hcp_project.outputs.output_engine import TNT_RouteGraphEngine, HCPMapRenderer, MotionStateExplainer
-from hcp_project.eval.evaluate import HCPEvaluator
+from data.womd_parser import WOMDParser
+from data.dataset_router import DatasetRouter, transform_to_ego
+from hcp.pruner import HierarchicalCombinatorialPruner
+from outputs.output_engine import TNT_RouteGraphEngine, HCPMapRenderer, MotionStateExplainer
+from eval.evaluate import HCPEvaluator
+
+# ---------------------------------------------------------------------------
+# Geo helpers — convert ego-centric metres to geographic coords for map UI
+# ---------------------------------------------------------------------------
+SCENARIO_ANCHORS = [
+    {"lat": 37.7749, "lng": -122.4194, "city": "San Francisco"},
+    {"lat": 40.7580, "lng": -73.9855, "city": "New York"},
+    {"lat": 51.5074, "lng": -0.1278, "city": "London"},
+    {"lat": 48.8566, "lng": 2.3522, "city": "Paris"},
+    {"lat": 35.6762, "lng": 139.6503, "city": "Tokyo"},
+    {"lat": 1.2903, "lng": 103.8520, "city": "Singapore"},
+    {"lat": -33.8688, "lng": 151.2093, "city": "Sydney"},
+    {"lat": 52.5200, "lng": 13.4050, "city": "Berlin"},
+    {"lat": 55.7558, "lng": 37.6173, "city": "Moscow"},
+    {"lat": 34.0522, "lng": -118.2437, "city": "Los Angeles"},
+    {"lat": 43.6532, "lng": -79.3832, "city": "Toronto"},
+    {"lat": 25.2048, "lng": 55.2708, "city": "Dubai"},
+    {"lat": 41.9028, "lng": 12.4964, "city": "Rome"},
+    {"lat": -23.5505, "lng": -46.6333, "city": "São Paulo"},
+    {"lat": 19.4326, "lng": -99.1332, "city": "Mexico City"},
+]
+
+def _get_anchor(scenario_id: str) -> dict:
+    """Deterministic per-scenario city anchor."""
+    idx = int(scenario_id.split('_')[-1]) if '_' in scenario_id else 0
+    return SCENARIO_ANCHORS[idx % len(SCENARIO_ANCHORS)]
+
+def _metres_to_geo(x_m: float, y_m: float, anchor_lat: float, anchor_lng: float):
+    """Convert ego-centric metres offset → (lng, lat)."""
+    lat = anchor_lat + y_m / 111_320.0
+    lng = anchor_lng + x_m / (111_320.0 * math.cos(math.radians(anchor_lat)))
+    return lng, lat
 
 
 app = FastAPI(title="HCP + MTR Autonomous Driving Telemetry Dashboard")
@@ -104,6 +137,7 @@ def get_scenario(s_id: str):
         
     cache = cached_scenarios[s_id]
     batch = cache["batch"]
+    anchor = _get_anchor(s_id)
     
     # Serialize history
     history = batch.history_traj.tolist() # (N, T_hist, 6)
@@ -114,14 +148,44 @@ def get_scenario(s_id: str):
     map_polylines = []
     for poly in batch.map_polylines:
         map_polylines.append(poly.tolist())
-        
+
+    # Convert predictions to geographic coordinates for map overlay
+    geo_predictions = []  # (N, K, T, [lng, lat])
+    preds_np = cache["predictions"]
+    for n in range(preds_np.shape[0]):
+        agent_modes = []
+        for k in range(preds_np.shape[1]):
+            mode_coords = []
+            for t in range(preds_np.shape[2]):
+                lng, lat = _metres_to_geo(
+                    float(preds_np[n, k, t, 0]),
+                    float(preds_np[n, k, t, 1]),
+                    anchor["lat"], anchor["lng"]
+                )
+                mode_coords.append([lng, lat])
+            agent_modes.append(mode_coords)
+        geo_predictions.append(agent_modes)
+
+    # Convert agent current positions to geo (last history point)
+    agent_positions = []
+    for n in range(batch.history_traj.shape[0]):
+        last_pt = batch.history_traj[n, -1]
+        lng, lat = _metres_to_geo(
+            float(last_pt[0]), float(last_pt[1]),
+            anchor["lat"], anchor["lng"]
+        )
+        agent_positions.append({"lng": lng, "lat": lat, "type": batch.agent_types[n]})
+
     return {
         "scenario_id": s_id,
         "agent_types": batch.agent_types,
         "history": history,
         "predictions": preds,
         "confidences": confs,
-        "map_polylines": map_polylines
+        "map_polylines": map_polylines,
+        "ego_origin": {"lat": anchor["lat"], "lng": anchor["lng"], "city": anchor["city"]},
+        "geo_predictions": geo_predictions,
+        "agent_positions": agent_positions
     }
 
 @app.get("/audio/{s_id}")
@@ -221,6 +285,7 @@ def get_metrics():
 def stream_scenario(s_id: str):
     """
     SSE stream generating real-time coordinate frames at 10 Hz.
+    Returns both ego-centric (x,y) and geographic (lng,lat) coords.
     """
     if s_id not in cached_scenarios:
         raise HTTPException(status_code=404, detail="Scenario not found")
@@ -229,6 +294,7 @@ def stream_scenario(s_id: str):
     batch = cache["batch"]
     preds = cache["predictions"]
     confs = cache["confidences"]
+    anchor = _get_anchor(s_id)
     
     async def event_generator():
         # Iterate over timeline scrubber (0s to 6s in steps of 0.5s -> 12 steps)
@@ -239,7 +305,10 @@ def stream_scenario(s_id: str):
                 # Retrieve highest confidence path coordinates at t_step
                 best_mode = int(np.argmax(confs[n]))
                 state = preds[n, best_mode, t_step]
-                
+                lng, lat = _metres_to_geo(
+                    float(state[0]), float(state[1]),
+                    anchor["lat"], anchor["lng"]
+                )
                 frame_data.append({
                     "agent_id": n,
                     "type": batch.agent_types[n],
@@ -247,13 +316,30 @@ def stream_scenario(s_id: str):
                     "y": float(state[1]),
                     "vx": float(state[2]),
                     "vy": float(state[3]),
-                    "heading": float(state[4])
+                    "heading": float(state[4]),
+                    "lng": lng,
+                    "lat": lat
                 })
             
             yield f"data: {json.dumps({'step': t_step, 'agents': frame_data})}\n\n"
-            await asyncio.sleep(0.1) # 10 Hz stream
+            await asyncio.sleep(0.5)  # 2 Hz for visible animation
             
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# ── Serve React build if available, otherwise inline HTML ──
+UI_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui", "dist")
+
+@app.on_event("startup")
+def mount_spa():
+    if os.path.isdir(UI_DIST):
+        app.mount("/assets", StaticFiles(directory=os.path.join(UI_DIST, "assets")), name="spa-assets")
+
+@app.get("/app")
+def serve_spa():
+    index = os.path.join(UI_DIST, "index.html")
+    if os.path.isfile(index):
+        return FileResponse(index)
+    return Response(content="React build not found. Run: cd ui && npm run build", status_code=404)
 
 # Direct HTML landing page — fully rewritten dashboard
 @app.get("/")
