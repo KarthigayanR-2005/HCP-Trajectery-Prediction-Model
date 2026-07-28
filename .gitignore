@@ -1,34 +1,6 @@
-# Datasets
-*.tar
+hcp_project/data/
 *.tgz
-*tfrecord*
-hcp_project/data/nuscenes/
-hcp_project/data/waymo/
-
-# Python Cache
+*.pth
+*.pkl
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache/
 .ipynb_checkpoints/
-
-# Environments & OS
-.env
-.env.*
-.DS_Store
-Thumbs.db
-
-# Large media outputs (keep graphs, main.tex)
-hcp_project/outputs/*.mp3
-hcp_project/outputs/*.png
-hcp_project/outputs/*.html
-hcp_project/outputs/*.json
-hcp_project/outputs/mtr_checkpoint.pth
-
-node_modules/
-err.txt
-walkthrough.md.resolved
-*.resolved
-
-hcp_project/outputs/

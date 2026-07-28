@@ -356,7 +356,7 @@ if __name__ == "__main__":
     router = DatasetRouter(
         nuscenes_dir=os.path.join(os.path.dirname(__file__), "nuscenes"),
         waymo_dir=os.path.join(os.path.dirname(__file__), "waymo"),
-        mode="waymo",
+        mode="nuscenes",
     )
     batch = router[0]
     print(f"Loaded batch for scenario {batch.scenario_id}")

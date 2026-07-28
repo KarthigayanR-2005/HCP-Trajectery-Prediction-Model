@@ -182,7 +182,7 @@ def train_model(
     waymo_dir    = os.path.join(data_dir, "data", "waymo")
 
     # Build base dataset router (index-addressable)
-    base_dataset = DatasetRouter(nuscenes_dir, waymo_dir, mode="waymo")
+    base_dataset = DatasetRouter(nuscenes_dir, waymo_dir, mode="nuscenes")
 
     # High-throughput streaming dataloader
     scenario_indices = list(range(len(base_dataset)))
