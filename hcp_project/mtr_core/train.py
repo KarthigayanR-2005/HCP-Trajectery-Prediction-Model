@@ -226,6 +226,8 @@ def train_model(
     waymo_dir    = os.path.join(data_dir, "data", "waymo")
 
     # Build base dataset router (index-addressable)
+    print("Building DatasetRouter (this loads and processes all nuScenes metadata "
+          "into trajectory slices — can take a couple of minutes on the full trainval split)...")
     base_dataset = DatasetRouter(nuscenes_dir, waymo_dir, mode="nuscenes")
 
     # High-throughput streaming dataloader
@@ -240,7 +242,10 @@ def train_model(
     )
 
     # -------------------------------------------------------------- model
+    print("Building model (downloads ImageNet-pretrained ResNet18 weights on first "
+          "run if not already cached — needs internet access)...")
     model  = MTRMotionTransformer(d_model=256, n_modes=6).to(device)
+    print("Model built.")
     pruner = HierarchicalCombinatorialPruner().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 

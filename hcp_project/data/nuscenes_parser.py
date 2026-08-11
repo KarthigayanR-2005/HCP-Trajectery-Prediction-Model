@@ -299,10 +299,14 @@ class NuScenesParser:
             print("No nuScenes meta tables found or dataset is empty. Using mock data.")
             return []
 
+        print(f"Loading nuScenes tables: {len(scenes)} scenes, {len(samples)} samples, "
+              f"{len(annotations)} annotations, {len(instances)} instances...")
+
         sample_dict = {s["token"]: s for s in samples}
         ego_pose_dict = {s["token"]: e for s, e in zip(samples, ego_poses)}
         cat_dict = {c["token"]: c["name"] for c in categories}
         inst_dict = {i["token"]: i for i in instances}
+        print("Building sensor file index (sample_data/calibrated_sensor/sensor)...")
         sensor_index = self._build_sensor_index(samples)
 
         ann_by_inst = {}
@@ -312,9 +316,14 @@ class NuScenesParser:
                 ann_by_inst[inst_tok] = []
             ann_by_inst[inst_tok].append(ann)
 
+        print(f"Processing {len(ann_by_inst)} instance tracks into trajectory slices...")
         processed_tracks = []
+        num_instances = len(ann_by_inst)
 
-        for inst_tok, anns in ann_by_inst.items():
+        for processed_count, (inst_tok, anns) in enumerate(ann_by_inst.items()):
+            if processed_count > 0 and processed_count % 5000 == 0:
+                print(f"  ...{processed_count}/{num_instances} instances processed "
+                      f"({len(processed_tracks)} trajectory slices so far)")
             anns = sorted(anns, key=lambda a: sample_dict[a["sample_token"]]["timestamp"])
             if len(anns) < 17:
                 continue

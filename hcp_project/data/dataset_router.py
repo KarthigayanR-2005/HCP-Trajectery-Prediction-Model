@@ -193,7 +193,9 @@ class DatasetRouter(Dataset):
         self.map_wrapper     = NuScenesMapWrapper(nuscenes_dir)
 
         self.nuscenes_data = self.nuscenes_parser.process_dataset()
+        print(f"DatasetRouter: {len(self.nuscenes_data)} nuScenes trajectory slices ready.")
         self.waymo_ids     = self.womd_parser.get_all_scenario_ids()
+        print("DatasetRouter: initialization complete.")
 
     # ------------------------------------------------------------------
     def __len__(self):
