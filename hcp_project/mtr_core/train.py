@@ -171,6 +171,8 @@ def train_model(
     lr: float = 1e-4,
     grad_accum: int = 4,
     num_workers: int = 2,
+    resume_model: str = None,
+    save_every: int = 1,
 ):
     print("Initialising training pipeline …")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -208,10 +210,46 @@ def train_model(
     )
 
     history_loss: list = []
+    start_epoch = 0
+
+    # ------------------------------------------------------- resume, if asked
+    if resume_model:
+        if not os.path.exists(resume_model):
+            raise FileNotFoundError(f"--resume_model path does not exist: {resume_model}")
+        print(f"Resuming from checkpoint: {resume_model}")
+        ckpt = torch.load(resume_model, map_location=device)
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            # New-style checkpoint (saved by this updated train.py)
+            model.load_state_dict(ckpt["model_state_dict"])
+            if ckpt.get("optimizer_state_dict") is not None:
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                except Exception as e:
+                    print(f"Warning: could not restore optimizer state ({e}); "
+                          f"continuing with a freshly-initialised optimizer.")
+            start_epoch = ckpt.get("epoch", 0)
+            history_loss = ckpt.get("history_loss", [])
+            print(f"Resumed model + optimizer from epoch {start_epoch} "
+                  f"({len(history_loss)} prior loss entries).")
+        else:
+            # Old-style checkpoint (a bare model.state_dict(), e.g. the
+            # original nuScenes-mini run) — weights only, no epoch/optimizer
+            # info to restore, so we start counting epochs from 0 but keep
+            # the pretrained weights instead of random init.
+            model.load_state_dict(ckpt)
+            print("Resumed model weights from a legacy (state-dict-only) "
+                  "checkpoint. No epoch/optimizer info was stored in it, so "
+                  "epoch counting restarts at 0, but training continues from "
+                  "these weights rather than from scratch.")
+
     print(f"Starting training … (effective batch = {batch_size} × {grad_accum} = "
           f"{batch_size * grad_accum} scenes)")
 
-    for epoch in range(epochs):
+    out_dir = os.path.join(data_dir, "outputs")
+    ckpt_dir = os.path.join(out_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    for epoch in range(start_epoch, start_epoch + epochs):
         model.train()
         epoch_loss = epoch_reg = epoch_cls = 0.0
         n_steps    = 0
@@ -295,15 +333,27 @@ def train_model(
         avg_loss = epoch_loss / max(n_steps, 1)
         history_loss.append(avg_loss)
         elapsed  = time.time() - start_time
-        print(f"Epoch {epoch + 1}/{epochs} | Loss: {avg_loss:.4f} | "
-              f"Steps: {n_steps} | Time: {elapsed:.2f}s")
+        final_epoch_number = epoch + 1   # 1-indexed, absolute (accounts for resume)
+        print(f"Epoch {final_epoch_number} (target end: {start_epoch + epochs}) | "
+              f"Loss: {avg_loss:.4f} | Steps: {n_steps} | Time: {elapsed:.2f}s")
+
+        # ------------------------------------------------ per-epoch checkpoint
+        if save_every > 0 and final_epoch_number % save_every == 0:
+            ckpt_payload = {
+                "model_state_dict":     model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch":                final_epoch_number,
+                "history_loss":         history_loss,
+            }
+            epoch_ckpt_path = os.path.join(ckpt_dir, f"mtr_epoch_{final_epoch_number}.pth")
+            torch.save(ckpt_payload, epoch_ckpt_path)
+            # Also overwrite the "latest" pointer used by --resume_model
+            torch.save(ckpt_payload, os.path.join(out_dir, "mtr_checkpoint.pth"))
+            print(f"  Saved checkpoint: {epoch_ckpt_path} (and updated mtr_checkpoint.pth)")
 
     # ------------------------------------------------------------------ save outputs
-    out_dir = os.path.join(data_dir, "outputs")
-    os.makedirs(out_dir, exist_ok=True)
-
     plt.figure()
-    plt.plot(range(1, epochs + 1), history_loss, marker='o', color='#1D9E75')
+    plt.plot(range(1, len(history_loss) + 1), history_loss, marker='o', color='#1D9E75')
     plt.title("HCP + MTR Training Loss Curve")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
@@ -311,7 +361,13 @@ def train_model(
     plt.savefig(os.path.join(out_dir, "loss_curve.png"))
     plt.close()
 
-    torch.save(model.state_dict(), os.path.join(out_dir, "mtr_checkpoint.pth"))
+    final_payload = {
+        "model_state_dict":     model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch":                start_epoch + epochs,
+        "history_loss":         history_loss,
+    }
+    torch.save(final_payload, os.path.join(out_dir, "mtr_checkpoint.pth"))
     print("Training finished.  Checkpoint saved.")
 
 
@@ -329,6 +385,15 @@ if __name__ == "__main__":
                         help="Gradient accumulation steps (effective batch × this)")
     parser.add_argument("--num_workers", type=int,   default=2,
                         help="DataLoader worker processes (0 = main process)")
+    parser.add_argument("--resume_model", type=str, default=None,
+                        help="Path to a checkpoint (.pth) to resume from. Accepts "
+                             "either this script's own checkpoint format (model + "
+                             "optimizer + epoch) or a bare model.state_dict() from "
+                             "an older run — the latter restores weights only and "
+                             "restarts epoch counting at 0.")
+    parser.add_argument("--save_every", type=int, default=1,
+                        help="Save a checkpoint every N epochs (default: every epoch). "
+                             "Set to 0 to only save once at the very end.")
     args = parser.parse_args()
 
     train_model(
@@ -337,4 +402,6 @@ if __name__ == "__main__":
         lr=args.lr,
         grad_accum=args.grad_accum,
         num_workers=args.num_workers,
+        resume_model=args.resume_model,
+        save_every=args.save_every,
     )
