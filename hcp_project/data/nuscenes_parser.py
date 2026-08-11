@@ -36,42 +36,37 @@ class NuScenesMapWrapper:
             return
 
         # The devkit expects <dataroot>/maps/expansion/<map_name>.json.
-        # Some map-expansion zips extract with that layout already in
-        # place; others drop the four location .json files flatter (e.g.
-        # directly under maps/, or at the archive root). Try the expected
-        # path first, then search for it and use whatever directory
-        # actually contains it as the dataroot.
-        expected = os.path.join(self.map_dir, "maps", "expansion", f"{self.location}.json")
-        dataroot = self.map_dir
-        if not os.path.exists(expected):
+        # Map-expansion zips extract with varying internal layouts depending
+        # on how/when they were downloaded (nested under maps/expansion/,
+        # flat under expansion/, flat at the root, etc.) — rather than
+        # trying to infer dataroot by counting directory levels above
+        # wherever the file happens to be found (fragile, breaks silently
+        # on layouts that don't match what was assumed), always copy
+        # whatever file is found into the exact path the devkit expects,
+        # then point dataroot at self.map_dir directly. Idempotent — skips
+        # the copy if it's already sitting in the right place.
+        target_dir  = os.path.join(self.map_dir, "maps", "expansion")
+        target_path = os.path.join(target_dir, f"{self.location}.json")
+
+        if not os.path.exists(target_path):
             hits = glob.glob(os.path.join(self.map_dir, "**", f"{self.location}.json"), recursive=True)
-            expansion_hit = next((h for h in hits if os.path.basename(os.path.dirname(h)) == "expansion"), None)
-            if expansion_hit:
-                # dataroot is two levels above .../maps/expansion/<file>.json
-                dataroot = os.path.dirname(os.path.dirname(os.path.dirname(expansion_hit)))
-            elif hits:
-                # Found the json but not under a maps/expansion/ folder —
-                # stage it into the layout the devkit requires.
-                staged_dir = os.path.join(self.map_dir, "maps", "expansion")
-                os.makedirs(staged_dir, exist_ok=True)
-                staged_path = os.path.join(staged_dir, f"{self.location}.json")
-                if not os.path.exists(staged_path):
-                    try:
-                        import shutil
-                        shutil.copy(hits[0], staged_path)
-                    except Exception as e:
-                        print(f"Could not stage map file into expected layout: {e}")
-                        return
-                dataroot = self.map_dir
-            else:
+            if not hits:
                 print(f"No {self.location}.json map-expansion file found under {self.map_dir} "
                       f"— using procedural mock map until it's extracted there.")
                 return
+            try:
+                import shutil
+                os.makedirs(target_dir, exist_ok=True)
+                shutil.copy(hits[0], target_path)
+            except Exception as e:
+                print(f"Found a map-expansion file at {hits[0]} but couldn't stage it "
+                      f"into the layout the devkit expects ({e}) — using procedural mock map.")
+                return
 
         try:
-            self.nusc_map = NuScenesMap(dataroot=dataroot, map_name=self.location)
+            self.nusc_map = NuScenesMap(dataroot=self.map_dir, map_name=self.location)
             self.is_mock = False
-            print(f"Loaded real nuScenes map for '{self.location}' from {dataroot}.")
+            print(f"Loaded real nuScenes map for '{self.location}' from {self.map_dir}.")
         except Exception as e:
             print(f"Found map-expansion files but failed to load real map ({e}) — "
                   f"using procedural mock map.")
