@@ -1,49 +1,168 @@
 import os
 import json
 import math
+import glob
 import numpy as np
 from shapely.geometry import Polygon, LineString
+from shapely.ops import unary_union
+
 
 class NuScenesMapWrapper:
     """
     Wrapper for nuScenes Map queries. Provides lane centerlines, crosswalks,
-    and drivable area within 500m ego-radius. Falls back to procedurally generated 
-    maps if nuScenes database is mock/incomplete.
+    and drivable area within a given ego-radius.
+
+    Tries to load the *real* map using nuscenes-devkit's NuScenesMap (reads
+    the vector layers from <map_dir>/maps/expansion/<location>.json, which is
+    what the official map-expansion .zip is meant to populate). If that
+    fails for any reason (package not installed, expansion pack not
+    extracted yet, folder layout doesn't match, location name not found,
+    etc.) it falls back to the previous procedurally-generated placeholder
+    map, so training never breaks because of a missing/misplaced file.
     """
+
     def __init__(self, map_dir, location="singapore-onenorth"):
         self.map_dir = map_dir
         self.location = location
-        # If we have real maps, we could load them. Otherwise, we procedurally generate
         self.is_mock = True
-        
+        self.nusc_map = None
+        self._load_real_map()
+
+    def _load_real_map(self):
+        try:
+            from nuscenes.map_expansion.map_api import NuScenesMap
+        except ImportError:
+            print("nuscenes-devkit not importable — using procedural mock map.")
+            return
+
+        # The devkit expects <dataroot>/maps/expansion/<map_name>.json.
+        # Some map-expansion zips extract with that layout already in
+        # place; others drop the four location .json files flatter (e.g.
+        # directly under maps/, or at the archive root). Try the expected
+        # path first, then search for it and use whatever directory
+        # actually contains it as the dataroot.
+        expected = os.path.join(self.map_dir, "maps", "expansion", f"{self.location}.json")
+        dataroot = self.map_dir
+        if not os.path.exists(expected):
+            hits = glob.glob(os.path.join(self.map_dir, "**", f"{self.location}.json"), recursive=True)
+            expansion_hit = next((h for h in hits if os.path.basename(os.path.dirname(h)) == "expansion"), None)
+            if expansion_hit:
+                # dataroot is two levels above .../maps/expansion/<file>.json
+                dataroot = os.path.dirname(os.path.dirname(os.path.dirname(expansion_hit)))
+            elif hits:
+                # Found the json but not under a maps/expansion/ folder —
+                # stage it into the layout the devkit requires.
+                staged_dir = os.path.join(self.map_dir, "maps", "expansion")
+                os.makedirs(staged_dir, exist_ok=True)
+                staged_path = os.path.join(staged_dir, f"{self.location}.json")
+                if not os.path.exists(staged_path):
+                    try:
+                        import shutil
+                        shutil.copy(hits[0], staged_path)
+                    except Exception as e:
+                        print(f"Could not stage map file into expected layout: {e}")
+                        return
+                dataroot = self.map_dir
+            else:
+                print(f"No {self.location}.json map-expansion file found under {self.map_dir} "
+                      f"— using procedural mock map until it's extracted there.")
+                return
+
+        try:
+            self.nusc_map = NuScenesMap(dataroot=dataroot, map_name=self.location)
+            self.is_mock = False
+            print(f"Loaded real nuScenes map for '{self.location}' from {dataroot}.")
+        except Exception as e:
+            print(f"Found map-expansion files but failed to load real map ({e}) — "
+                  f"using procedural mock map.")
+            self.nusc_map = None
+            self.is_mock = True
+
+    # ------------------------------------------------------------------
     def get_map_elements(self, ego_x, ego_y, radius=500.0):
         """
         Returns lane centerlines, crosswalk polygons, and drivable area.
-        Complexity: O(N) where N is map elements in spatial range.
         """
-        # Procedurally generate map lanes, crosswalks, and drivable areas in ego-centric coords
+        if not self.is_mock and self.nusc_map is not None:
+            try:
+                return self._get_real_map_elements(ego_x, ego_y, radius)
+            except Exception as e:
+                print(f"Real map query failed ({e}) — falling back to procedural mock "
+                      f"map for this call.")
+        return self._get_mock_map_elements(ego_x, ego_y, radius)
+
+    def _get_real_map_elements(self, ego_x, ego_y, radius):
+        nm = self.nusc_map
+        records = nm.get_records_in_radius(
+            ego_x, ego_y, radius, layer_names=["lane", "lane_connector", "ped_crossing", "drivable_area"]
+        )
+
+        # --- lane centerlines (lane + lane_connector share the same discretizer) ---
+        lane_tokens = records.get("lane", []) + records.get("lane_connector", [])
+        lanes = []
+        if lane_tokens:
+            discretized = nm.discretize_lanes(lane_tokens, resolution_meters=1.0)
+            for token, pts in discretized.items():
+                if len(pts) >= 2:
+                    lanes.append(LineString([(p[0], p[1]) for p in pts]))
+
+        # --- crosswalks: each ped_crossing record has a polygon_token ---
+        crosswalks = []
+        for tok in records.get("ped_crossing", []):
+            try:
+                rec = nm.get("ped_crossing", tok)
+                poly = nm.extract_polygon(rec["polygon_token"])
+                if poly.is_valid and not poly.is_empty:
+                    crosswalks.append(poly)
+            except Exception:
+                continue
+
+        # --- drivable area: union every polygon under every matched record ---
+        drivable_polys = []
+        for tok in records.get("drivable_area", []):
+            try:
+                rec = nm.get("drivable_area", tok)
+                for poly_tok in rec.get("polygon_tokens", []):
+                    poly = nm.extract_polygon(poly_tok)
+                    if poly.is_valid and not poly.is_empty:
+                        drivable_polys.append(poly)
+            except Exception:
+                continue
+
+        if drivable_polys:
+            drivable_area = unary_union(drivable_polys)
+        else:
+            # No drivable_area record within radius — fall back to a coarse
+            # bounding envelope around the ego position rather than leaving
+            # it empty, so downstream code (which expects one polygon)
+            # doesn't have to special-case "no drivable area".
+            drivable_area = Polygon([
+                (ego_x - radius, ego_y - radius), (ego_x + radius, ego_y - radius),
+                (ego_x + radius, ego_y + radius), (ego_x - radius, ego_y + radius),
+            ])
+
+        return {"lanes": lanes, "crosswalks": crosswalks, "drivable_area": drivable_area}
+
+    def _get_mock_map_elements(self, ego_x, ego_y, radius=500.0):
+        # Procedurally generate map lanes, crosswalks, and drivable areas in
+        # ego-centric coords. Unchanged fallback behaviour from before.
         lanes = []
         crosswalks = []
-        
-        # Ego lane (main road)
-        # 3 lanes, straight ahead
+
         for offset in [-3.5, 0.0, 3.5]:
             lane_pts = []
             for y in np.arange(-radius, radius, 10.0):
-                # Add slight curve to lanes for realistic testing
                 x = offset + 10.0 * math.sin(y / 150.0)
                 lane_pts.append((x + ego_x, y + ego_y))
             lanes.append(LineString(lane_pts))
-            
-        # Intersecting road (crossroad)
+
         for offset in [-3.5, 0.0, 3.5]:
             lane_pts = []
             for x in np.arange(-radius, radius, 10.0):
                 y = offset + 10.0 * math.cos(x / 150.0)
                 lane_pts.append((x + ego_x, y + ego_y))
             lanes.append(LineString(lane_pts))
-            
-        # Crosswalk polygons (near intersection at 50m, 100m, etc.)
+
         for x_val in [-100.0, 100.0]:
             poly = Polygon([
                 (x_val - 5.0 + ego_x, -20.0 + ego_y),
@@ -52,9 +171,7 @@ class NuScenesMapWrapper:
                 (x_val - 5.0 + ego_x, 20.0 + ego_y)
             ])
             crosswalks.append(poly)
-            
-        # Drivable area polygon
-        # A large envelope around our roads
+
         drivable_coords = [
             (-50.0 + ego_x, -radius + ego_y),
             (50.0 + ego_x, -radius + ego_y),
@@ -66,18 +183,72 @@ class NuScenesMapWrapper:
             (-radius + ego_x, -50.0 + ego_y),
         ]
         drivable_area = Polygon(drivable_coords)
-        
-        return {
-            "lanes": lanes,
-            "crosswalks": crosswalks,
-            "drivable_area": drivable_area
-        }
+
+        return {"lanes": lanes, "crosswalks": crosswalks, "drivable_area": drivable_area}
+
+
+# ---------------------------------------------------------------------------
+# Sensor (camera / LiDAR) file loaders
+# ---------------------------------------------------------------------------
+# These read the raw blob files nuScenes ships in v1.0-trainvalNN_blobs.tgz.
+# NOTE: nothing in MTRMotionTransformer currently consumes images or point
+# clouds as model input — the transformer's tokenizer only takes agent
+# tracks + map polylines. These loaders make the blob data indexed and
+# ready to use; actually learning from raw pixels/points needs a new
+# encoder branch feeding into the fusion stage, which is a separate,
+# larger architecture change.
+
+def load_camera_image(data_dir, rel_path):
+    """Load a camera keyframe as a PIL RGB image. rel_path is the
+    'filename' field from sample_data.json, e.g. 'samples/CAM_FRONT/xxx.jpg'.
+    Returns None if the file isn't present (e.g. that blob part wasn't
+    downloaded)."""
+    full_path = os.path.join(data_dir, rel_path)
+    if not os.path.exists(full_path):
+        return None
+    from PIL import Image
+    return Image.open(full_path).convert("RGB")
+
+
+def load_lidar_points(data_dir, rel_path):
+    """Load a LIDAR_TOP sweep. nuScenes stores these as raw float32 binary
+    files with 5 columns per point: x, y, z, intensity, ring_index (in the
+    sensor's own frame — not yet transformed to ego/world frame).
+    Returns an (N, 5) numpy array, or None if the file isn't present."""
+    full_path = os.path.join(data_dir, rel_path)
+    if not os.path.exists(full_path):
+        return None
+    points = np.fromfile(full_path, dtype=np.float32)
+    if points.size % 5 != 0:
+        print(f"Warning: {rel_path} isn't a multiple of 5 floats — "
+              f"may not be a standard nuScenes LIDAR_TOP sweep.")
+        return None
+    return points.reshape(-1, 5)
+
 
 class NuScenesParser:
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, version=None):
+        """
+        version: name of the metadata folder to load from data_dir, e.g.
+        "v1.0-trainval" (the real full split) or "v1.0-mini" (small dev
+        split). If left as None (default), auto-detects by checking which
+        of the two actually exists under data_dir — preferring
+        v1.0-trainval if both are present — instead of assuming one
+        hardcoded value.
+        """
         self.data_dir = data_dir
-        self.meta_dir = os.path.join(data_dir, "v1.0-mini")
-        
+        if version is None:
+            version = self._detect_version(data_dir)
+        self.meta_dir = os.path.join(data_dir, version)
+
+    @staticmethod
+    def _detect_version(data_dir):
+        if os.path.isdir(os.path.join(data_dir, "v1.0-trainval")):
+            return "v1.0-trainval"
+        if os.path.isdir(os.path.join(data_dir, "v1.0-mini")):
+            return "v1.0-mini"
+        return "v1.0-trainval"
+
     def load_table(self, table_name):
         path = os.path.join(self.meta_dir, f"{table_name}.json")
         if not os.path.exists(path):
@@ -85,49 +256,77 @@ class NuScenesParser:
         with open(path, 'r') as f:
             return json.load(f)
 
+    def _build_sensor_index(self, samples):
+        """
+        Maps sample_token -> {channel: relative_filename} for keyframe
+        sensor data (camera + LIDAR), using sample_data.json joined through
+        calibrated_sensor.json / sensor.json to get each record's channel
+        name (e.g. 'CAM_FRONT', 'LIDAR_TOP'). Returns {} if sample_data
+        wasn't downloaded/extracted (e.g. only the metadata archive is
+        present so far, no blobs) — that's a normal, expected state, not
+        an error.
+        """
+        sample_data = self.load_table("sample_data")
+        calibrated_sensors = self.load_table("calibrated_sensor")
+        sensors = self.load_table("sensor")
+        if not sample_data or not calibrated_sensors or not sensors:
+            return {}
+
+        sensor_by_tok = {s["token"]: s["channel"] for s in sensors}
+        channel_by_cs_tok = {
+            cs["token"]: sensor_by_tok.get(cs["sensor_token"])
+            for cs in calibrated_sensors
+        }
+
+        index = {}
+        for sd in sample_data:
+            if not sd.get("is_key_frame", False):
+                continue  # sweeps are non-annotated intermediate frames; skip for now
+            channel = channel_by_cs_tok.get(sd["calibrated_sensor_token"])
+            if channel is None:
+                continue
+            index.setdefault(sd["sample_token"], {})[channel] = sd["filename"]
+        return index
+
     def process_dataset(self):
         """
         Parses agent tracks and maps.
         Extracts 2s history (5 steps at 2Hz) and 6s future (12 steps at 2Hz).
         """
-        # Load tables
         scenes = self.load_table("scene")
         samples = self.load_table("sample")
         ego_poses = self.load_table("ego_pose")
         annotations = self.load_table("sample_annotation")
         instances = self.load_table("instance")
         categories = self.load_table("category")
-        
+
         if not scenes:
             print("No nuScenes meta tables found or dataset is empty. Using mock data.")
             return []
-            
+
         sample_dict = {s["token"]: s for s in samples}
         ego_pose_dict = {s["token"]: e for s, e in zip(samples, ego_poses)}
         cat_dict = {c["token"]: c["name"] for c in categories}
         inst_dict = {i["token"]: i for i in instances}
-        
-        # Group annotations by instance
+        sensor_index = self._build_sensor_index(samples)
+
         ann_by_inst = {}
         for ann in annotations:
             inst_tok = ann["instance_token"]
             if inst_tok not in ann_by_inst:
                 ann_by_inst[inst_tok] = []
             ann_by_inst[inst_tok].append(ann)
-            
+
         processed_tracks = []
-        
-        # Process instance trajectories
+
         for inst_tok, anns in ann_by_inst.items():
-            # Sort by sample timestamp
             anns = sorted(anns, key=lambda a: sample_dict[a["sample_token"]]["timestamp"])
-            if len(anns) < 17: # Need at least 17 steps for 2s history (5) + 6s future (12)
+            if len(anns) < 17:
                 continue
-                
+
             inst = inst_dict[inst_tok]
             cat_name = cat_dict[inst["category_token"]]
-            
-            # Extract track states
+
             states = []
             for i in range(len(anns)):
                 ann = anns[i]
@@ -135,10 +334,9 @@ class NuScenesParser:
                 t_us = sample["timestamp"]
                 x, y, z = ann["translation"]
                 qw, qx, qy, qz = ann["rotation"]
-                
-                # Heading from quaternion (yaw)
+
                 heading = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-                
+
                 states.append({
                     "timestamp_us": t_us,
                     "x": x,
@@ -146,22 +344,24 @@ class NuScenesParser:
                     "heading_rad": heading,
                     "width": ann["size"][0],
                     "length": ann["size"][1],
+                    # Relative paths into samples/CAM_FRONT/..., samples/LIDAR_TOP/...
+                    # (empty dict if sample_data/blobs weren't extracted).
+                    # Use load_camera_image()/load_lidar_points() to read them.
+                    "sensor_files": sensor_index.get(ann["sample_token"], {}),
                 })
-                
-            # Compute velocities and accelerations using central differences
+
             for i in range(len(states)):
                 t_curr = states[i]["timestamp_us"] / 1e6
                 x_curr = states[i]["x"]
                 y_curr = states[i]["y"]
-                
+
                 if i > 0 and i < len(states) - 1:
                     t_prev = states[i-1]["timestamp_us"] / 1e6
                     t_next = states[i+1]["timestamp_us"] / 1e6
-                    
+
                     vx = (states[i+1]["x"] - states[i-1]["x"]) / (t_next - t_prev)
                     vy = (states[i+1]["y"] - states[i-1]["y"]) / (t_next - t_prev)
-                    
-                    # Acceleration
+
                     ax = (states[i+1]["x"] - 2 * x_curr + states[i-1]["x"]) / ((t_next - t_prev) / 2) ** 2
                     ay = (states[i+1]["y"] - 2 * y_curr + states[i-1]["y"]) / ((t_next - t_prev) / 2) ** 2
                 elif i == 0:
@@ -174,20 +374,18 @@ class NuScenesParser:
                     vx = (x_curr - states[i-1]["x"]) / (t_curr - t_prev)
                     vy = (y_curr - states[i-1]["y"]) / (t_curr - t_prev)
                     ax, ay = 0.0, 0.0
-                    
+
                 states[i]["vx"] = vx
                 states[i]["vy"] = vy
                 states[i]["ax"] = ax
                 states[i]["ay"] = ay
                 states[i]["track_id"] = inst_tok
                 states[i]["category"] = cat_name
-                
-            # Create slices of 2s history and 6s future
-            # Split index represents the t=0 frame. We need 4 frames before and 12 frames after
+
             for pivot in range(4, len(states) - 12):
-                history = states[pivot-4 : pivot+1]
-                future = states[pivot+1 : pivot+13]
-                
+                history = states[pivot-4: pivot+1]
+                future = states[pivot+1: pivot+13]
+
                 processed_tracks.append({
                     "track_id": inst_tok,
                     "category": cat_name,
@@ -195,10 +393,15 @@ class NuScenesParser:
                     "future": future,
                     "ego_pose": ego_pose_dict[anns[pivot]["sample_token"]]
                 })
-                
+
         return processed_tracks
+
 
 if __name__ == "__main__":
     parser = NuScenesParser(os.path.join(os.path.dirname(__file__), "nuscenes"))
     tracks = parser.process_dataset()
     print(f"Processed {len(tracks)} trajectory slices from nuScenes.")
+    if tracks:
+        sample_sensor_files = tracks[0]["history"][-1].get("sensor_files", {})
+        print(f"Sensor channels indexed for first track's latest history frame: "
+              f"{list(sample_sensor_files.keys())}")
