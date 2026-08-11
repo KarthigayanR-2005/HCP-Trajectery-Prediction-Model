@@ -21,11 +21,28 @@ class NuScenesMapWrapper:
     map, so training never breaks because of a missing/misplaced file.
     """
 
-    def __init__(self, map_dir, location="singapore-onenorth"):
+    def __init__(self, map_dir, location="singapore-onenorth",
+                 cache_resolution=20.0, cache_max_entries=5000):
+        """
+        cache_resolution : ego positions are rounded to this many meters
+                            before querying, so nearby positions reuse the
+                            same cached map-query result instead of
+                            re-running the (expensive) real map query from
+                            scratch. This matters a lot in practice: a full
+                            nuScenes scene reuses the same handful of ego
+                            positions across many different agent-track
+                            slices, so most calls are near-duplicates.
+        cache_max_entries : caps cache memory growth; a large trainval run
+                            has many unique scenes, so this bounds how much
+                            gets cached rather than growing unbounded.
+        """
         self.map_dir = map_dir
         self.location = location
         self.is_mock = True
         self.nusc_map = None
+        self._cache = {}
+        self._cache_resolution = cache_resolution
+        self._cache_max_entries = cache_max_entries
         self._load_real_map()
 
     def _load_real_map(self):
@@ -77,14 +94,30 @@ class NuScenesMapWrapper:
     def get_map_elements(self, ego_x, ego_y, radius=500.0):
         """
         Returns lane centerlines, crosswalk polygons, and drivable area.
+        Cached by (rounded ego position, radius) — see __init__ docstring.
         """
+        cache_key = (
+            round(ego_x / self._cache_resolution),
+            round(ego_y / self._cache_resolution),
+            radius,
+        )
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         if not self.is_mock and self.nusc_map is not None:
             try:
-                return self._get_real_map_elements(ego_x, ego_y, radius)
+                result = self._get_real_map_elements(ego_x, ego_y, radius)
             except Exception as e:
                 print(f"Real map query failed ({e}) — falling back to procedural mock "
                       f"map for this call.")
-        return self._get_mock_map_elements(ego_x, ego_y, radius)
+                result = self._get_mock_map_elements(ego_x, ego_y, radius)
+        else:
+            result = self._get_mock_map_elements(ego_x, ego_y, radius)
+
+        if len(self._cache) < self._cache_max_entries:
+            self._cache[cache_key] = result
+        return result
 
     def _get_real_map_elements(self, ego_x, ego_y, radius):
         nm = self.nusc_map
