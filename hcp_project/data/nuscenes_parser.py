@@ -261,7 +261,11 @@ class NuScenesParser:
         present so far, no blobs) — that's a normal, expected state, not
         an error.
         """
+        print("  Loading sample_data.json (covers every keyframe + intermediate "
+              "sweep across the whole dataset — this is usually the largest "
+              "table and can take a while to parse on the full trainval split)...")
         sample_data = self.load_table("sample_data")
+        print(f"  Loaded {len(sample_data)} sample_data entries.")
         calibrated_sensors = self.load_table("calibrated_sensor")
         sensors = self.load_table("sensor")
         if not sample_data or not calibrated_sensors or not sensors:
@@ -273,14 +277,20 @@ class NuScenesParser:
             for cs in calibrated_sensors
         }
 
+        print("  Indexing keyframe sensor files by sample...")
         index = {}
-        for sd in sample_data:
+        total = len(sample_data)
+        for i, sd in enumerate(sample_data):
+            if i > 0 and i % 500000 == 0:
+                print(f"    ...{i}/{total} sample_data entries scanned "
+                      f"({len(index)} samples indexed so far)")
             if not sd.get("is_key_frame", False):
                 continue  # sweeps are non-annotated intermediate frames; skip for now
             channel = channel_by_cs_tok.get(sd["calibrated_sensor_token"])
             if channel is None:
                 continue
             index.setdefault(sd["sample_token"], {})[channel] = sd["filename"]
+        print(f"  Sensor index built: {len(index)} samples indexed.")
         return index
 
     def process_dataset(self):
