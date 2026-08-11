@@ -215,6 +215,7 @@ def train_model(
     num_workers: int = 2,
     resume_model: str = None,
     save_every: int = 1,
+    max_steps_per_epoch: int = None,
 ):
     print("Initialising training pipeline …")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -310,8 +311,16 @@ def train_model(
         epoch_loss = epoch_reg = epoch_cls = 0.0
         n_steps    = 0
         start_time = time.time()
+        total_steps_estimate = -(-len(base_dataset) // batch_size)  # ceil division
+        effective_total = min(total_steps_estimate, max_steps_per_epoch) if max_steps_per_epoch else total_steps_estimate
+        print(f"Epoch {epoch + 1}: ~{total_steps_estimate:,} steps in a full pass "
+              f"({len(base_dataset):,} scenes / batch_size {batch_size})"
+              + (f", capped to {max_steps_per_epoch:,} steps this run." if max_steps_per_epoch else "."))
 
         for step_idx, collated in enumerate(dataloader):
+            if max_steps_per_epoch is not None and step_idx >= max_steps_per_epoch:
+                print(f"  Reached --max_steps_per_epoch={max_steps_per_epoch}, ending epoch early.")
+                break
             # ---- Unpack collated batch ----------------------------------------
             # collated["history_traj"] : (sum_N, T_hist, 6) — all agents packed
             # collated["batch_splits"] : list[int]          — agents per scene
@@ -391,6 +400,17 @@ def train_model(
             epoch_loss += step_loss
             n_steps    += 1
 
+            if step_idx > 0 and step_idx % 50 == 0:
+                elapsed        = time.time() - start_time
+                steps_per_sec  = step_idx / elapsed
+                running_avg    = epoch_loss / n_steps
+                remaining      = effective_total - step_idx
+                eta_hours      = (remaining / steps_per_sec / 3600) if steps_per_sec > 0 else float("nan")
+                print(f"  step {step_idx:,}/{effective_total:,} | "
+                      f"loss (running avg): {running_avg:.4f} | "
+                      f"{steps_per_sec:.2f} steps/s | "
+                      f"ETA for this epoch: {eta_hours:.1f}h")
+
         # ---------------------------------------------------------------- epoch summary
         avg_loss = epoch_loss / max(n_steps, 1)
         history_loss.append(avg_loss)
@@ -456,6 +476,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_every", type=int, default=1,
                         help="Save a checkpoint every N epochs (default: every epoch). "
                              "Set to 0 to only save once at the very end.")
+    parser.add_argument("--max_steps_per_epoch", type=int, default=None,
+                        help="Cap each epoch to this many steps, then move on. Useful "
+                             "for smoke-testing on a huge dataset (e.g. full nuScenes "
+                             "trainval, ~195k steps/epoch at batch_size=2) without "
+                             "waiting hours to see if training works at all. Omit "
+                             "for a real full-dataset training run.")
     args = parser.parse_args()
 
     train_model(
@@ -466,4 +492,5 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         resume_model=args.resume_model,
         save_every=args.save_every,
+        max_steps_per_epoch=args.max_steps_per_epoch,
     )
