@@ -216,6 +216,7 @@ def train_model(
     resume_model: str = None,
     save_every: int = 1,
     max_steps_per_epoch: int = None,
+    profile_steps: int = 0,
 ):
     print("Initialising training pipeline …")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -311,6 +312,7 @@ def train_model(
         epoch_loss = epoch_reg = epoch_cls = 0.0
         n_steps    = 0
         start_time = time.time()
+        t_prev_end = start_time
         total_steps_estimate = -(-len(base_dataset) // batch_size)  # ceil division
         effective_total = min(total_steps_estimate, max_steps_per_epoch) if max_steps_per_epoch else total_steps_estimate
         print(f"Epoch {epoch + 1}: ~{total_steps_estimate:,} steps in a full pass "
@@ -321,6 +323,9 @@ def train_model(
             if max_steps_per_epoch is not None and step_idx >= max_steps_per_epoch:
                 print(f"  Reached --max_steps_per_epoch={max_steps_per_epoch}, ending epoch early.")
                 break
+            if profile_steps > 0 and step_idx < profile_steps:
+                t_data_ready = time.time()
+                t_compute_start = t_data_ready
             # ---- Unpack collated batch ----------------------------------------
             # collated["history_traj"] : (sum_N, T_hist, 6) — all agents packed
             # collated["batch_splits"] : list[int]          — agents per scene
@@ -399,6 +404,15 @@ def train_model(
 
             epoch_loss += step_loss
             n_steps    += 1
+
+            if profile_steps > 0 and step_idx < profile_steps:
+                torch.cuda.synchronize() if device.type == "cuda" else None
+                t_compute_end = time.time()
+                data_wait_time = t_data_ready - t_prev_end if step_idx > 0 else 0.0
+                compute_time   = t_compute_end - t_compute_start
+                print(f"  [profile] step {step_idx}: data_wait={data_wait_time:.3f}s "
+                      f"compute={compute_time:.3f}s total={data_wait_time + compute_time:.3f}s")
+                t_prev_end = t_compute_end
 
             if step_idx > 0 and step_idx % 50 == 0:
                 elapsed        = time.time() - start_time
@@ -482,6 +496,10 @@ if __name__ == "__main__":
                              "trainval, ~195k steps/epoch at batch_size=2) without "
                              "waiting hours to see if training works at all. Omit "
                              "for a real full-dataset training run.")
+    parser.add_argument("--profile_steps", type=int, default=0,
+                        help="Print a data-loading-time vs. compute-time breakdown "
+                             "for the first N steps, to diagnose what's actually slow "
+                             "before choosing how to speed up training. 0 = off.")
     args = parser.parse_args()
 
     train_model(
@@ -493,4 +511,5 @@ if __name__ == "__main__":
         resume_model=args.resume_model,
         save_every=args.save_every,
         max_steps_per_epoch=args.max_steps_per_epoch,
+        profile_steps=args.profile_steps,
     )
