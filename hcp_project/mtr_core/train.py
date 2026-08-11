@@ -33,6 +33,7 @@ from hcp_project.mtr_core.tokenizer import MapTokenizer, AgentTokenizer
 from hcp_project.mtr_core.encoder import MTREncoder
 from hcp_project.fusion.fusion import CrossAttentionFusionLayer
 from hcp_project.mtr_core.decoder import MTRDecoder
+from hcp_project.mtr_core.image_encoder import ImageEncoder
 from hcp_project.hcp.pruner import HierarchicalCombinatorialPruner
 from hcp_project.utils.mixed_precision import ScaleTrainingManager
 
@@ -42,7 +43,8 @@ from hcp_project.utils.mixed_precision import ScaleTrainingManager
 # ---------------------------------------------------------------------------
 
 class MTRMotionTransformer(nn.Module):
-    def __init__(self, d_model: int = 256, n_modes: int = 6, T_fut: int = 12):
+    def __init__(self, d_model: int = 256, n_modes: int = 6, T_fut: int = 12,
+                 use_image: bool = True, pretrained_image: bool = True):
         super().__init__()
         self.map_tokenizer   = MapTokenizer(in_channels=3,  d_model=d_model)
         self.agent_tokenizer = AgentTokenizer(in_channels=6, d_model=d_model)
@@ -50,12 +52,33 @@ class MTRMotionTransformer(nn.Module):
         self.fusion          = CrossAttentionFusionLayer(d_model=d_model, nhead=8)
         self.decoder         = MTRDecoder(d_model=d_model, n_modes=n_modes, T_fut=T_fut)
 
-    def forward(self, history_traj, map_polylines, hcp_mask=None):
+        # Optional CAM_FRONT image branch. Backbone stays frozen (see
+        # ImageEncoder docstring) — only its projection head trains, since
+        # this dataset is small relative to what fine-tuning a ResNet wants.
+        # use_image=False fully disables this (forward() ignores any
+        # camera_images passed in), for training/testing without vision.
+        self.use_image = use_image
+        if use_image:
+            self.image_encoder = ImageEncoder(out_dim=d_model, pretrained=pretrained_image,
+                                               freeze_backbone=True)
+        else:
+            self.image_encoder = None
+
+    def forward(self, history_traj, map_polylines, hcp_mask=None,
+                camera_images=None, has_image_mask=None):
         """
         Args:
-            history_traj  : (B, N, T_hist, 6)
-            map_polylines : list[list[np.ndarray]] — outer = batch, inner = polylines
-            hcp_mask      : (B, N, n_modes) bool, optional
+            history_traj    : (B, N, T_hist, 6)
+            map_polylines   : list[list[np.ndarray]] — outer = batch, inner = polylines
+            hcp_mask        : (B, N, n_modes) bool, optional
+            camera_images   : (B, 3, 224, 224), optional — preprocessed CAM_FRONT
+                               keyframes (see image_encoder.preprocess_image).
+                               Ignored if use_image=False or not provided.
+            has_image_mask  : (B,) bool/float, optional — which scenes in the
+                               batch have a *real* image vs. a zero placeholder
+                               (see UnifiedBatch.has_image). Scenes without a
+                               real image get zero image-context contribution
+                               rather than noise from encoding a blank image.
         """
         B, N, T_hist, _ = history_traj.shape
         device = history_traj.device
@@ -64,6 +87,19 @@ class MTRMotionTransformer(nn.Module):
         flat_hist   = history_traj.view(B * N, T_hist, -1)
         agent_tokens = self.agent_tokenizer(flat_hist)   # (B*N, d_model)
         agent_tokens = agent_tokens.view(B, N, -1)        # (B, N, d_model)
+
+        # 1b. Fuse scene-level image context into every agent token --------------
+        # CAM_FRONT is a single ego-centric view of the whole scene, not
+        # per-agent, so it's broadcast-added to every agent's token — the
+        # same additive-conditioning pattern used elsewhere in this
+        # codebase, letting the self-attention encoder below propagate that
+        # context across agents rather than just tacking it on afterward.
+        if self.use_image and camera_images is not None:
+            img_emb = self.image_encoder(camera_images)   # (B, d_model)
+            if has_image_mask is not None:
+                mask = has_image_mask.to(device=device, dtype=img_emb.dtype).view(B, 1)
+                img_emb = img_emb * mask
+            agent_tokens = agent_tokens + img_emb.unsqueeze(1)  # (B, 1, d_model) broadcast over N
 
         # 2. Tokenise map polylines ----------------------------------------------
         max_polys = 20
@@ -151,13 +187,19 @@ def _compute_loss_for_manager(model, batch_data, device):
     """
     Bridges the ScaleTrainingManager API to the model's forward + GMM loss.
     batch_data must contain 'hist_traj', 'gt_traj', 'map_polylines', 'hcp_mask'.
+    Optionally contains 'camera_images' / 'has_image_mask' for the image branch.
     """
     hist_traj    = batch_data["hist_traj"].to(device)
     gt_traj      = batch_data["gt_traj"].to(device)
     map_polylines = batch_data["map_polylines"]
     hcp_mask     = batch_data["hcp_mask"].to(device) if batch_data.get("hcp_mask") is not None else None
+    camera_images  = batch_data.get("camera_images")
+    has_image_mask = batch_data.get("has_image_mask")
+    if camera_images is not None:
+        camera_images = camera_images.to(device)
 
-    pred_trajs, confidences = model(hist_traj, map_polylines, hcp_mask)
+    pred_trajs, confidences = model(hist_traj, map_polylines, hcp_mask,
+                                     camera_images=camera_images, has_image_mask=has_image_mask)
     return compute_gmm_loss(pred_trajs, confidences, gt_traj)
 
 
@@ -220,7 +262,12 @@ def train_model(
         ckpt = torch.load(resume_model, map_location=device)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             # New-style checkpoint (saved by this updated train.py)
-            model.load_state_dict(ckpt["model_state_dict"])
+            missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            if missing or unexpected:
+                print(f"Note: resumed with a checkpoint saved before the image branch "
+                      f"existed (or a mismatched architecture) — {len(missing)} new "
+                      f"param(s) initialised fresh (e.g. image_encoder.*), "
+                      f"{len(unexpected)} old param(s) ignored.")
             if ckpt.get("optimizer_state_dict") is not None:
                 try:
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -236,11 +283,15 @@ def train_model(
             # original nuScenes-mini run) — weights only, no epoch/optimizer
             # info to restore, so we start counting epochs from 0 but keep
             # the pretrained weights instead of random init.
-            model.load_state_dict(ckpt)
+            missing, unexpected = model.load_state_dict(ckpt, strict=False)
             print("Resumed model weights from a legacy (state-dict-only) "
                   "checkpoint. No epoch/optimizer info was stored in it, so "
                   "epoch counting restarts at 0, but training continues from "
                   "these weights rather than from scratch.")
+            if missing or unexpected:
+                print(f"Note: {len(missing)} new param(s) initialised fresh "
+                      f"(e.g. image_encoder.* if this checkpoint predates the "
+                      f"image branch), {len(unexpected)} old param(s) ignored.")
 
     print(f"Starting training … (effective batch = {batch_size} × {grad_accum} = "
           f"{batch_size * grad_accum} scenes)")
@@ -281,6 +332,10 @@ def train_model(
             hist_padded = hist_padded.to(device)
             fut_padded  = fut_padded.to(device)
 
+            # ---- Camera images (one CAM_FRONT keyframe per scene) -------------
+            camera_images  = collated.get("camera_images")   # (B, 3, 224, 224) or None
+            has_image_mask = collated.get("has_image")       # (B,) bool or None
+
             # Reconstruct per-scene polyline lists for the model
             map_tensors = collated["map_tensors"]   # flat list of (P_i, 3) tensors
             map_splits  = collated["map_splits"]    # polylines per scene
@@ -318,10 +373,12 @@ def train_model(
 
             # ---- AMP forward + backward via ScaleTrainingManager --------------
             batch_data = {
-                "hist_traj":     hist_padded,
-                "gt_traj":       fut_padded,
-                "map_polylines": map_polylines_batch,
-                "hcp_mask":      hcp_mask,
+                "hist_traj":      hist_padded,
+                "gt_traj":        fut_padded,
+                "map_polylines":  map_polylines_batch,
+                "hcp_mask":       hcp_mask,
+                "camera_images":  camera_images,
+                "has_image_mask": has_image_mask,
             }
             step_loss = scale_mgr.execute_step(
                 batch_data, _compute_loss_for_manager, step_idx)
