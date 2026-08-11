@@ -260,15 +260,23 @@ class NuScenesParser:
         wasn't downloaded/extracted (e.g. only the metadata archive is
         present so far, no blobs) — that's a normal, expected state, not
         an error.
+
+        sample_data.json is by far the largest table (every keyframe AND
+        every intermediate sweep, for every sensor, for the whole dataset —
+        multiple millions of rows on the full trainval split). Loading it
+        whole via json.load() before filtering can use several GB of RAM
+        just for that one table, risking an out-of-memory crash on a
+        constrained environment like Colab's free tier. So this streams the
+        file with ijson instead when available, filtering to keyframes as
+        it goes rather than ever holding the full unfiltered list in memory.
         """
-        print("  Loading sample_data.json (covers every keyframe + intermediate "
-              "sweep across the whole dataset — this is usually the largest "
-              "table and can take a while to parse on the full trainval split)...")
-        sample_data = self.load_table("sample_data")
-        print(f"  Loaded {len(sample_data)} sample_data entries.")
+        sample_data_path = os.path.join(self.meta_dir, "sample_data.json")
+        if not os.path.exists(sample_data_path):
+            return {}
+
         calibrated_sensors = self.load_table("calibrated_sensor")
         sensors = self.load_table("sensor")
-        if not sample_data or not calibrated_sensors or not sensors:
+        if not calibrated_sensors or not sensors:
             return {}
 
         sensor_by_tok = {s["token"]: s["channel"] for s in sensors}
@@ -277,7 +285,40 @@ class NuScenesParser:
             for cs in calibrated_sensors
         }
 
-        print("  Indexing keyframe sensor files by sample...")
+        try:
+            import ijson
+            print("  Streaming sample_data.json with ijson (keeps memory bounded "
+                  "regardless of file size — the multi-million-row full-trainval "
+                  "table won't be held whole in RAM)...")
+            index = {}
+            count = 0
+            with open(sample_data_path, "rb") as f:
+                for sd in ijson.items(f, "item"):
+                    count += 1
+                    if count % 500000 == 0:
+                        print(f"    ...{count} sample_data entries scanned "
+                              f"({len(index)} samples indexed so far)")
+                    if not sd.get("is_key_frame", False):
+                        continue
+                    channel = channel_by_cs_tok.get(sd["calibrated_sensor_token"])
+                    if channel is None:
+                        continue
+                    index.setdefault(sd["sample_token"], {})[channel] = sd["filename"]
+            print(f"  Sensor index built: {count} sample_data entries scanned, "
+                  f"{len(index)} samples indexed.")
+            return index
+        except ImportError:
+            print("  ijson not installed — falling back to loading sample_data.json "
+                  "whole (uses more memory; pip install ijson to avoid this).")
+            return self._build_sensor_index_fallback(sample_data_path, channel_by_cs_tok)
+
+    def _build_sensor_index_fallback(self, sample_data_path, channel_by_cs_tok):
+        """Non-streaming fallback for _build_sensor_index when ijson isn't
+        available — loads the whole table into memory at once."""
+        with open(sample_data_path, "r") as f:
+            sample_data = json.load(f)
+        print(f"  Loaded {len(sample_data)} sample_data entries.")
+
         index = {}
         total = len(sample_data)
         for i, sd in enumerate(sample_data):
@@ -285,7 +326,7 @@ class NuScenesParser:
                 print(f"    ...{i}/{total} sample_data entries scanned "
                       f"({len(index)} samples indexed so far)")
             if not sd.get("is_key_frame", False):
-                continue  # sweeps are non-annotated intermediate frames; skip for now
+                continue
             channel = channel_by_cs_tok.get(sd["calibrated_sensor_token"])
             if channel is None:
                 continue
