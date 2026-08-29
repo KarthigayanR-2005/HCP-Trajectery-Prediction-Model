@@ -217,6 +217,7 @@ def train_model(
     save_every: int = 1,
     max_steps_per_epoch: int = None,
     profile_steps: int = 0,
+    save_every_steps: int = 500,
 ):
     print("Initialising training pipeline …")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -260,6 +261,7 @@ def train_model(
 
     history_loss: list = []
     start_epoch = 0
+    total_steps_trained = 0  # persists across epochs/chunks and across --resume_model
 
     # ------------------------------------------------------- resume, if asked
     if resume_model:
@@ -283,7 +285,9 @@ def train_model(
                           f"continuing with a freshly-initialised optimizer.")
             start_epoch = ckpt.get("epoch", 0)
             history_loss = ckpt.get("history_loss", [])
-            print(f"Resumed model + optimizer from epoch {start_epoch} "
+            total_steps_trained = ckpt.get("total_steps", 0)
+            print(f"Resumed model + optimizer from epoch {start_epoch}, "
+                  f"{total_steps_trained:,} total steps previously trained "
                   f"({len(history_loss)} prior loss entries).")
         else:
             # Old-style checkpoint (a bare model.state_dict(), e.g. the
@@ -404,6 +408,23 @@ def train_model(
 
             epoch_loss += step_loss
             n_steps    += 1
+            total_steps_trained += 1
+
+            # ---------------------------------------------- step-based checkpoint
+            # Saves every save_every_steps steps, independent of chunk/epoch size —
+            # so an interruption never costs more than save_every_steps of progress,
+            # regardless of how large --max_steps_per_epoch is set to.
+            if save_every_steps > 0 and total_steps_trained % save_every_steps == 0:
+                ckpt_payload = {
+                    "model_state_dict":     model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "epoch":                epoch,  # chunk in progress, not yet complete
+                    "history_loss":         history_loss,
+                    "total_steps":          total_steps_trained,
+                }
+                torch.save(ckpt_payload, os.path.join(out_dir, "mtr_checkpoint.pth"))
+                print(f"  [checkpoint] saved at {total_steps_trained:,} total steps "
+                      f"(mtr_checkpoint.pth updated)")
 
             if profile_steps > 0 and step_idx < profile_steps:
                 torch.cuda.synchronize() if device.type == "cuda" else None
@@ -440,6 +461,7 @@ def train_model(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "epoch":                final_epoch_number,
                 "history_loss":         history_loss,
+                "total_steps":          total_steps_trained,
             }
             epoch_ckpt_path = os.path.join(ckpt_dir, f"mtr_epoch_{final_epoch_number}.pth")
             torch.save(ckpt_payload, epoch_ckpt_path)
@@ -462,6 +484,7 @@ def train_model(
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch":                start_epoch + epochs,
         "history_loss":         history_loss,
+        "total_steps":          total_steps_trained,
     }
     torch.save(final_payload, os.path.join(out_dir, "mtr_checkpoint.pth"))
     print("Training finished.  Checkpoint saved.")
@@ -500,6 +523,11 @@ if __name__ == "__main__":
                         help="Print a data-loading-time vs. compute-time breakdown "
                              "for the first N steps, to diagnose what's actually slow "
                              "before choosing how to speed up training. 0 = off.")
+    parser.add_argument("--save_every_steps", type=int, default=500,
+                        help="Save a checkpoint every N steps, independent of chunk/epoch "
+                             "size — so an interruption never costs more than this many "
+                             "steps of progress, no matter how large --max_steps_per_epoch "
+                             "is. Set to 0 to disable (fall back to only per-epoch saves).")
     args = parser.parse_args()
 
     train_model(
@@ -512,4 +540,5 @@ if __name__ == "__main__":
         save_every=args.save_every,
         max_steps_per_epoch=args.max_steps_per_epoch,
         profile_steps=args.profile_steps,
+        save_every_steps=args.save_every_steps,
     )
