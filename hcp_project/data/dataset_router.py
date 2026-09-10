@@ -183,12 +183,12 @@ class DatasetRouter(Dataset):
                        Pass None (default) to keep arrays in RAM.
     """
 
-    def __init__(self, nuscenes_dir, waymo_dir, mode="nuscenes", mmap_dir=None):
+    def __init__(self, nuscenes_dir, waymo_dir, mode="nuscenes", mmap_dir=None, scene_filter=None):
         self.mode        = mode.lower()
         self.mmap_dir    = mmap_dir
         self.nuscenes_dir = nuscenes_dir
 
-        self.nuscenes_parser = NuScenesParser(nuscenes_dir)
+        self.nuscenes_parser = NuScenesParser(nuscenes_dir, scene_filter=scene_filter)
         self.womd_parser     = WOMDParser(waymo_dir)
         self.map_wrapper     = NuScenesMapWrapper(nuscenes_dir)
 

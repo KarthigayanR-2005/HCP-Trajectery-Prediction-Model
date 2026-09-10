@@ -34,7 +34,7 @@ from hcp_project.mtr_core.encoder import MTREncoder
 from hcp_project.fusion.fusion import CrossAttentionFusionLayer
 from hcp_project.mtr_core.decoder import MTRDecoder
 from hcp_project.mtr_core.image_encoder import ImageEncoder
-from hcp_project.hcp.pruner import HierarchicalCombinatorialPruner
+from hcp_project.hcp.pruner import HierarchicalCombinatorialPruner, generate_kinematic_candidates
 from hcp_project.utils.mixed_precision import ScaleTrainingManager
 
 
@@ -218,6 +218,9 @@ def train_model(
     max_steps_per_epoch: int = None,
     profile_steps: int = 0,
     save_every_steps: int = 500,
+    lr_patience: int = 2,
+    lr_factor: float = 0.5,
+    override_lr: float = None,
 ):
     print("Initialising training pipeline …")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -252,6 +255,14 @@ def train_model(
     pruner = HierarchicalCombinatorialPruner().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
+    # Learning-rate scheduler: halves LR when the per-chunk loss stops
+    # improving for `lr_patience` consecutive chunks — the standard fix for
+    # a genuine training plateau (loss flat across several full chunks,
+    # not just step-to-step noise within one chunk).
+    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=lr_factor, patience=lr_patience,
+    )
+
     # AMP + gradient accumulation manager
     scale_mgr = ScaleTrainingManager(
         model=model,
@@ -283,12 +294,45 @@ def train_model(
                 except Exception as e:
                     print(f"Warning: could not restore optimizer state ({e}); "
                           f"continuing with a freshly-initialised optimizer.")
+            if ckpt.get("scheduler_state_dict") is not None:
+                try:
+                    lr_scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                    print(f"Resumed LR scheduler state (current LR: "
+                          f"{optimizer.param_groups[0]['lr']:.2e}).")
+                except Exception as e:
+                    print(f"Warning: could not restore LR scheduler state ({e}); "
+                          f"continuing with a freshly-initialised scheduler.")
+            else:
+                print("Note: checkpoint predates the LR scheduler — starting it fresh "
+                      "from the current LR (no restart needed, this is expected for "
+                      "any checkpoint saved before this feature was added).")
             start_epoch = ckpt.get("epoch", 0)
             history_loss = ckpt.get("history_loss", [])
             total_steps_trained = ckpt.get("total_steps", 0)
             print(f"Resumed model + optimizer from epoch {start_epoch}, "
                   f"{total_steps_trained:,} total steps previously trained "
                   f"({len(history_loss)} prior loss entries).")
+
+            if override_lr is not None:
+                # Explicitly reset the LR after loading the checkpoint's saved
+                # optimizer/scheduler state — useful when something about the
+                # training setup changed (e.g. a bug fix) such that the old
+                # plateau/LR-decay history no longer reflects genuine
+                # convergence, and the model needs room to actually adapt to
+                # the new situation rather than crawling at whatever tiny LR
+                # the scheduler had decayed down to beforehand.
+                old_lr = optimizer.param_groups[0]["lr"]
+                for g in optimizer.param_groups:
+                    g["lr"] = override_lr
+                # Also reset the scheduler's plateau-tracking state (best loss
+                # seen, bad-epoch count, cooldown) — that history was measured
+                # under the old conditions and isn't a meaningful baseline for
+                # judging whether the model has plateaued under the new ones.
+                lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, mode="min", factor=lr_factor, patience=lr_patience,
+                )
+                print(f"  --override_lr set: LR reset {old_lr:.2e} -> {override_lr:.2e}, "
+                      f"and the LR scheduler's plateau-tracking history was reset fresh.")
         else:
             # Old-style checkpoint (a bare model.state_dict(), e.g. the
             # original nuScenes-mini run) — weights only, no epoch/optimizer
@@ -369,14 +413,14 @@ def train_model(
                 map_polylines_batch.append(scene_polys)
                 mc += nm
 
-            # ---- HCP pruning mask (dense candidates from GT) -----------------
+            # ---- HCP pruning mask (real kinematic candidates from history —
+            # no ground truth involved, matching what's actually available
+            # at real inference time) --------------------------------------
             dense_candidates = torch.zeros((B, N_max, 6, T_fut, 5), device=device)
             for b in range(B):
                 for n in range(batch_splits[b]):
-                    gt = fut_padded[b, n]
-                    for k in range(6):
-                        noise = torch.randn_like(gt) * (k * 0.5)
-                        dense_candidates[b, n, k] = gt + noise
+                    dense_candidates[b, n] = generate_kinematic_candidates(
+                        hist_padded[b, n], T_fut=T_fut, dt=0.5, K=6)
 
             hcp_masks = []
             for b in range(B):
@@ -418,6 +462,7 @@ def train_model(
                 ckpt_payload = {
                     "model_state_dict":     model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": lr_scheduler.state_dict(),
                     "epoch":                epoch,  # chunk in progress, not yet complete
                     "history_loss":         history_loss,
                     "total_steps":          total_steps_trained,
@@ -454,11 +499,25 @@ def train_model(
         print(f"Epoch {final_epoch_number} (target end: {start_epoch + epochs}) | "
               f"Loss: {avg_loss:.4f} | Steps: {n_steps} | Time: {elapsed:.2f}s")
 
+        # ---------------------------------------------------- LR scheduler step
+        # Stepped once per completed chunk using that chunk's average loss —
+        # deliberately NOT per-step, since per-step loss is noisy (see the
+        # running-avg wobble in the printed step lines) and would trigger
+        # spurious reductions. A per-chunk average is a much more reliable
+        # plateau signal.
+        lr_before = optimizer.param_groups[0]["lr"]
+        lr_scheduler.step(avg_loss)
+        lr_after = optimizer.param_groups[0]["lr"]
+        if lr_after < lr_before:
+            print(f"  [lr scheduler] loss plateaued for {lr_patience} chunks — "
+                  f"reducing LR: {lr_before:.2e} -> {lr_after:.2e}")
+
         # ------------------------------------------------ per-epoch checkpoint
         if save_every > 0 and final_epoch_number % save_every == 0:
             ckpt_payload = {
                 "model_state_dict":     model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": lr_scheduler.state_dict(),
                 "epoch":                final_epoch_number,
                 "history_loss":         history_loss,
                 "total_steps":          total_steps_trained,
@@ -482,6 +541,7 @@ def train_model(
     final_payload = {
         "model_state_dict":     model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": lr_scheduler.state_dict(),
         "epoch":                start_epoch + epochs,
         "history_loss":         history_loss,
         "total_steps":          total_steps_trained,
@@ -528,6 +588,22 @@ if __name__ == "__main__":
                              "size — so an interruption never costs more than this many "
                              "steps of progress, no matter how large --max_steps_per_epoch "
                              "is. Set to 0 to disable (fall back to only per-epoch saves).")
+    parser.add_argument("--lr_patience", type=int, default=2,
+                        help="Number of consecutive chunks with no loss improvement "
+                             "before the learning rate is reduced. Checked once per "
+                             "completed chunk (--max_steps_per_epoch), using that "
+                             "chunk's average loss.")
+    parser.add_argument("--lr_factor", type=float, default=0.5,
+                        help="Multiplier applied to the learning rate each time the "
+                             "plateau patience is exceeded (0.5 = halve it).")
+    parser.add_argument("--override_lr", type=float, default=None,
+                        help="When resuming, explicitly reset the learning rate to this "
+                             "value (and reset the LR scheduler's plateau-tracking "
+                             "history) instead of continuing from whatever the "
+                             "checkpoint's saved optimizer state has. Useful after a "
+                             "bug fix or other change invalidates the old plateau "
+                             "history, so the model gets real room to adapt rather "
+                             "than crawling at an already-decayed-down LR.")
     args = parser.parse_args()
 
     train_model(
@@ -541,4 +617,7 @@ if __name__ == "__main__":
         max_steps_per_epoch=args.max_steps_per_epoch,
         profile_steps=args.profile_steps,
         save_every_steps=args.save_every_steps,
+        lr_patience=args.lr_patience,
+        lr_factor=args.lr_factor,
+        override_lr=args.override_lr,
     )

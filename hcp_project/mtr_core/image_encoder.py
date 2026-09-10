@@ -36,9 +36,37 @@ class ImageEncoder(nn.Module):
         self.backbone_out_dim = 512
         self.proj = nn.Linear(self.backbone_out_dim, out_dim)
 
+        self._backbone_frozen = freeze_backbone
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+            # requires_grad=False alone does NOT stop BatchNorm layers from
+            # updating their running_mean/running_var buffers, or from using
+            # noisy per-batch statistics instead of those running stats,
+            # whenever the outer model is in .train() mode (which it is for
+            # the whole rest of training). With batch_size as small as 2,
+            # per-batch BatchNorm statistics are extremely unstable — so the
+            # "frozen" backbone was still silently drifting and behaving
+            # differently at train time vs. eval time, even though its
+            # weights never changed. Force every BatchNorm submodule into
+            # permanent eval mode (always use the stable pretrained running
+            # stats, never per-batch stats, never update the buffers) so
+            # this component behaves identically during training and
+            # evaluation, matching what "frozen" is actually supposed to mean.
+            for m in self.backbone.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    m.eval()
+
+    def train(self, mode: bool = True):
+        """Overridden so that calling .train() on the outer model (as the
+        training loop does every epoch) can never pull the frozen backbone's
+        BatchNorm layers back into training-mode behaviour."""
+        super().train(mode)
+        if self._backbone_frozen:
+            for m in self.backbone.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    m.eval()
+        return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 3, 224, 224) already preprocessed via preprocess_image().

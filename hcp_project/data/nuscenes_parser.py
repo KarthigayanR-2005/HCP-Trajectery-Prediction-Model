@@ -255,7 +255,7 @@ def load_lidar_points(data_dir, rel_path):
 
 
 class NuScenesParser:
-    def __init__(self, data_dir, version=None):
+    def __init__(self, data_dir, version=None, scene_filter=None):
         """
         version: name of the metadata folder to load from data_dir, e.g.
         "v1.0-trainval" (the real full split) or "v1.0-mini" (small dev
@@ -263,11 +263,17 @@ class NuScenesParser:
         of the two actually exists under data_dir — preferring
         v1.0-trainval if both are present — instead of assuming one
         hardcoded value.
+        scene_filter: optional set/list of scene names (e.g. {"scene-0003",
+        "scene-0012", ...}) to restrict processing to. Use this to build a
+        train-only or val-only subset — e.g. via
+        nuscenes.utils.splits.create_splits_scenes()['val'] for the
+        official nuScenes val split. None (default) processes every scene.
         """
         self.data_dir = data_dir
         if version is None:
             version = self._detect_version(data_dir)
         self.meta_dir = os.path.join(data_dir, version)
+        self.scene_filter = set(scene_filter) if scene_filter is not None else None
 
     @staticmethod
     def _detect_version(data_dir):
@@ -382,6 +388,20 @@ class NuScenesParser:
         if not scenes:
             print("No nuScenes meta tables found or dataset is empty. Using mock data.")
             return []
+
+        if self.scene_filter is not None:
+            allowed_scene_tokens = {s["token"] for s in scenes if s["name"] in self.scene_filter}
+            # Filter samples and ego_poses together, preserving their existing
+            # positional alignment (ego_pose_dict below pairs them by index).
+            keep_mask = [s["scene_token"] in allowed_scene_tokens for s in samples]
+            samples   = [s for s, keep in zip(samples, keep_mask) if keep]
+            ego_poses = [e for e, keep in zip(ego_poses, keep_mask) if keep]
+            scenes    = [s for s in scenes if s["token"] in allowed_scene_tokens]
+            allowed_sample_tokens = {s["token"] for s in samples}
+            annotations = [a for a in annotations if a["sample_token"] in allowed_sample_tokens]
+            print(f"Scene filter applied: restricted to {len(scenes)} scene(s) "
+                  f"({len(self.scene_filter)} requested) -> {len(samples)} samples, "
+                  f"{len(annotations)} annotations remain.")
 
         print(f"Loading nuScenes tables: {len(scenes)} scenes, {len(samples)} samples, "
               f"{len(annotations)} annotations, {len(instances)} instances...")
