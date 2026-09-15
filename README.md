@@ -22,9 +22,10 @@ Trained and evaluated on the real [nuScenes](https://www.nuscenes.org/) dataset 
 
 ## Overview
 
-Trajectory prediction models typically score a fixed set of candidate future paths for each agent. HCP proposes cutting that candidate set down using cheap, staged filters — kinematic feasibility, spatial/map reachability, and social compatibility — **before** the expensive transformer runs, reducing computational cost. This project implements both halves and is built to measure the accuracy/cost trade-off directly, rather than assume it.
+Trajectory prediction models typically score a fixed set of candidate future paths for each agent. HCP aims to reduce computational cost by cutting that candidate set down using staged filters for kinematic feasibility, spatial/map reachability, and social compatibility. This project implements the pruning module and transformer core to measure the accuracy/cost trade-off. The current implementation does not yet skip decoder computation for pruned candidates, as explained under Known Limitations.
 
 **Inputs the model conditions on:**
+
 - Agent trajectory history (position, velocity, heading)
 - Real HD map geometry (lane centerlines, crosswalks, drivable area) via `nuscenes-devkit`
 - Real CAM_FRONT camera imagery (via a frozen, ImageNet-pretrained ResNet18 branch)
@@ -33,16 +34,18 @@ Trajectory prediction models typically score a fixed set of candidate future pat
 
 ## Architecture
 
-**Stage 1 — HCP Pruner** (`hcp_project/hcp/`)
+**Stage 1: HCP Pruner** (`hcp_project/hcp/`)
+
 | Filter | Purpose | Uses |
 |---|---|---|
 | KFF (Kinematic Feasibility Filter) | Rejects candidates violating curvature/jerk/acceleration limits | Candidate geometry only |
 | SRF (Spatial Reachability Filter) | Rejects candidates leaving the road / colliding with lane boundaries | Candidates + map |
 | SCF (Social Compatibility Filter) | Learned (GraphSAGE GNN) agent-interaction filter | Candidates + agent history |
 
-Candidates fed into the pruner are generated purely from each agent's own recent history (constant-velocity + a bank of turn-rate variations) — **no ground truth is used**, matching what would be available at real inference time.
+Candidates fed into the pruner are generated purely from each agent's own recent history (constant-velocity + a bank of turn-rate variations). **No ground truth is used**, matching what would be available at real inference time.
 
-**Stage 2 — MTR Core** (`hcp_project/mtr_core/`)
+**Stage 2: MTR Core** (`hcp_project/mtr_core/`)
+
 - PointNet-style tokenizer (agent history + map polylines)
 - Transformer encoder with Rotary Position Embeddings (RoPE)
 - Cross-attention fusion (agent ↔ map, RBF-distance-biased)
@@ -74,9 +77,9 @@ Requires an NVIDIA GPU with CUDA support (developed and tested on an RTX 3050, 6
 
 1. Register at the [nuScenes download page](https://www.nuscenes.org/download).
 2. Download, from the **Trainval** section:
-   - `v1.0-trainval_meta.tgz` (metadata — required)
-   - `nuScenes-map-expansion-v1.3.zip` (real map geometry — required)
-   - At least one `File blobs of 85 scenes` part (camera/LiDAR — used for the image branch; more parts = more scenes with real images)
+   - `v1.0-trainval_meta.tgz` (metadata, required)
+   - `nuScenes-map-expansion-v1.3.zip` (real map geometry, required)
+   - At least one `File blobs of 85 scenes` part (camera/LiDAR, used for the image branch; more parts provide more scenes with real images)
 3. Place the downloaded files in the repo root, then extract:
 
 ```bash
@@ -97,7 +100,7 @@ python -m hcp_project.mtr_core.train \
     --save_every_steps 1000
 ```
 
-**Resuming** (recommended for any run beyond the first — checkpoints save every `save_every_steps`, independent of chunk size):
+**Resuming** (recommended for any run beyond the first; checkpoints save every `save_every_steps`, independent of chunk size):
 
 ```bash
 python -m hcp_project.mtr_core.train \
@@ -109,10 +112,10 @@ python -m hcp_project.mtr_core.train \
 
 | Flag | Purpose |
 |---|---|
-| `--max_steps_per_epoch` | Caps each "epoch" to N steps — useful since one true full pass over the dataset is ~195k steps |
+| `--max_steps_per_epoch` | Caps each "epoch" to N steps; useful since one true full pass over the dataset is ~195k steps |
 | `--save_every_steps` | Checkpoint frequency, independent of chunk size |
 | `--lr_patience` / `--lr_factor` | `ReduceLROnPlateau` scheduler settings (halves LR after N stagnant chunks by default) |
-| `--override_lr` | Explicitly reset LR (and scheduler history) on resume — useful after a fix that changes model behavior |
+| `--override_lr` | Explicitly reset LR (and scheduler history) on resume; useful after a fix that changes model behavior |
 | `--profile_steps N` | Print a data-loading-time vs. compute-time breakdown for the first N steps |
 
 ---
@@ -137,13 +140,13 @@ python hcp_project/eval/diagnose_loss.py \
     --use_hcp --num_batches 100
 ```
 
-`evaluate.py` runs genuine model inference on real data and writes results to `hcp_project/outputs/eval_real_<timestamp>.json` — including an explicit note on data-split caveats for every run.
+`evaluate.py` runs genuine model inference on real data and writes results to `hcp_project/outputs/eval_real_<timestamp>.json`, including an explicit note on data-split caveats for every run.
 
 ---
 
 ## Current Results
 
-Evaluated on ~1.2M training steps (~6 full passes over the available trajectory data), full dataset:
+Reported full-dataset evaluation results after ~1.2M training steps (~6 full passes over the available trajectory data):
 
 | Metric | Value |
 |---|---|
@@ -152,32 +155,30 @@ Evaluated on ~1.2M training steps (~6 full passes over the available trajectory 
 | Miss Rate (2m) | ~98.5% |
 | Inference latency (HCP on / off) | ~9-16 ms / ~8-9 ms per agent |
 
-On the official 150-scene val split (soft check — see limitations below): minADE 25.82m, minFDE 25.17m, Miss Rate 98.9% — closely matching the full-dataset numbers.
+On the official 150-scene val split (soft check; see limitations below): minADE 25.82m, minFDE 25.17m, Miss Rate 98.9%, closely matching the full-dataset numbers.
 
 ---
 
 ## Known Limitations
 
-Documented honestly rather than glossed over:
-
-- **No true held-out validation split.** The current model trained on the full 850-scene dataset before any val/train separation was introduced. The val-split numbers above are a soft, approximate check (the model has already seen that data), not a rigorous generalization measure. A fully valid test requires either training a fresh model on only the official 700 train scenes, or submitting to nuScenes' official (hidden-label) Test-split challenge.
-- **HCP pruning does not yet reduce real inference latency.** The pruning mask correctly uses only history/map (no ground-truth leakage) and correctly identifies infeasible candidates, but the current decoder always computes all 6 candidate modes regardless of the mask — pruning affects which mode is trusted, not how much is computed. Making pruning skip real computation requires a decoder architecture change, not yet implemented.
+- **No true held-out validation split.** The current model trained on the full 850-scene dataset before any val/train separation was introduced. The val-split numbers above are an approximate check on previously seen data, not a rigorous generalization measure. Held-out validation requires training a fresh model on only the official 700 train scenes and evaluating on the 150 validation scenes.
+- **HCP pruning does not yet reduce real inference latency.** The pruning mask uses only history/map, but the current decoder always computes all 6 candidate modes regardless of the mask. Pruning affects which mode is trusted, not how much is computed. Making pruning skip real computation requires a decoder architecture change, not yet implemented.
 - **Only partial image coverage.** Only 1 of 10 nuScenes camera/LiDAR blob parts has been downloaded; the majority of training examples fall back to a zero-image placeholder rather than a real photo.
-- **Miss Rate remains high (~98%)** at a 2m threshold — indicating the model, while substantially improved from its initial state, is not yet at production-grade accuracy.
+- **Miss Rate remains high (~98%)** at a 2m threshold. The model is not yet at production-grade accuracy.
 
 ---
 
 ## Project Structure
 
-```
+```text
 hcp_project/
 ├── data/            # Dataset extraction, parsing, streaming (nuScenes + WOMD)
-├── mtr_core/         # Transformer model: tokenizer, encoder, decoder, training loop, image encoder
-├── hcp/              # Pruning filters: KFF, SRF, SCF
-├── fusion/            # Cross-attention fusion layer
-├── eval/              # Real evaluation and diagnostic scripts
-├── utils/             # Mixed-precision training utilities
-└── outputs/           # Checkpoints, logs, evaluation results (generated, not tracked)
+├── mtr_core/        # Transformer model: tokenizer, encoder, decoder, training loop, image encoder
+├── hcp/             # Pruning filters: KFF, SRF, SCF
+├── fusion/          # Cross-attention fusion layer
+├── eval/            # Real evaluation and diagnostic scripts
+├── utils/           # Mixed-precision training utilities
+└── outputs/         # Checkpoints, logs, evaluation results (generated, not tracked)
 ```
 
 ---
