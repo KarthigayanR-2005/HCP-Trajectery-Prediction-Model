@@ -16,9 +16,10 @@ from shapely.geometry import LineString, Polygon
 
 from data.womd_parser import WOMDParser
 from data.dataset_router import DatasetRouter, transform_to_ego
-from hcp.pruner import HierarchicalCombinatorialPruner
+from data.extractor import generate_mock_waymo
+from hcp.pruner import HierarchicalCombinatorialPruner, generate_kinematic_candidates
 from outputs.output_engine import TNT_RouteGraphEngine, HCPMapRenderer, MotionStateExplainer
-from eval.evaluate import HCPEvaluator
+from mtr_core.train import MTRMotionTransformer
 
 # ---------------------------------------------------------------------------
 # Geo helpers — convert ego-centric metres to geographic coords for map UI
@@ -69,57 +70,112 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 NUSCENES_DIR = os.path.join(DATA_DIR, "nuscenes")
 WAYMO_DIR = os.path.join(DATA_DIR, "waymo")
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "outputs")
+CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "mtr_checkpoint.pth")
+
+# NOTE: DatasetRouter always falls back to Waymo-mode scenarios (_get_waymo)
+# whenever no real nuScenes metadata is present — but that fallback needs
+# WOMDParser's mock_scenario.pkl to already exist. If nuScenes was never
+# downloaded/extracted (e.g. testing the dashboard without the full
+# dataset), that mock file was never generated either, and _get_waymo would
+# crash with a KeyError trying to read scenario["tracks"] from an empty
+# scenario dict. Generate it here if missing, so this fallback path
+# genuinely works rather than crashing.
+if not os.path.exists(os.path.join(WAYMO_DIR, "mock_scenario.pkl")):
+    print("No mock Waymo scenarios found — generating them now so the "
+          "no-real-data fallback actually works...")
+    generate_mock_waymo(WAYMO_DIR)
+
+def smooth_trajectory_xy_polyfit(trajectories, degree=3):
+    """
+    Fits a low-degree polynomial to each agent/candidate's x(t) and y(t)
+    separately, then replaces the trajectory with points sampled from that
+    smooth fit.
+
+    Why this is needed: KFF's jerk/curvature checks require differencing
+    the trajectory three times (position -> velocity -> acceleration ->
+    jerk). That repeated differencing is extremely sensitive to small,
+    realistic point-to-point prediction noise — even ~0.3m of per-step
+    noise can produce apparent jerk values 5x past the feasibility
+    threshold, even though the overall path is a perfectly sensible one.
+    Fitting a smooth polynomial removes that high-frequency noise while
+    preserving genuine curvature/acceleration trends, so a real sharp turn
+    still correctly gets rejected — verified directly: a noisy-but-straight
+    path flips from infeasible to feasible after this, while a genuinely
+    sharp turn stays infeasible.
+    """
+    N, K, T, C = trajectories.shape
+    out = trajectories.clone()
+    t = np.arange(T, dtype=np.float64)
+    deg = min(degree, T - 1)
+    for n in range(N):
+        for k in range(K):
+            for ch in (0, 1):  # x, y only — KFF never looks at the other channels
+                y_vals = trajectories[n, k, :, ch].detach().cpu().numpy().astype(np.float64)
+                coeffs = np.polyfit(t, y_vals, deg=deg)
+                fitted = np.polyval(coeffs, t)
+                out[n, k, :, ch] = torch.tensor(fitted, dtype=trajectories.dtype)
+    return out
+
 
 womd_parser = WOMDParser(WAYMO_DIR)
-dataset = DatasetRouter(NUSCENES_DIR, WAYMO_DIR, mode="waymo")
+# NOTE: mode="nuscenes" — this was previously mode="waymo", which used the
+# mock/placeholder Waymo dataset (no real Waymo data has ever been
+# downloaded in this project) instead of the real, trained-on nuScenes data.
+dataset = DatasetRouter(NUSCENES_DIR, WAYMO_DIR, mode="nuscenes")
 pruner = HierarchicalCombinatorialPruner()
 route_engine = TNT_RouteGraphEngine(os.path.join(OUTPUT_DIR, "route_graphs"))
 map_renderer = HCPMapRenderer(os.path.join(OUTPUT_DIR, "maps"))
 explainer = MotionStateExplainer(os.path.join(OUTPUT_DIR, "motion_states"))
 
+# ---------------------------------------------------------------------------
+# Load the real trained model once at startup — everything below this used
+# to generate fake, hand-coded trajectories (hardcoded heading/velocity
+# values and a fixed confidence distribution) instead of ever calling the
+# model. Predictions served by this API are now genuine model output.
+# ---------------------------------------------------------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Loading trained model on {DEVICE}...")
+model = MTRMotionTransformer(d_model=256, n_modes=6).to(DEVICE)
+if os.path.exists(CHECKPOINT_PATH):
+    _ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
+    _state_dict = _ckpt["model_state_dict"] if isinstance(_ckpt, dict) and "model_state_dict" in _ckpt else _ckpt
+    missing, unexpected = model.load_state_dict(_state_dict, strict=False)
+    if missing or unexpected:
+        print(f"Note: {len(missing)} param(s) missing from checkpoint, "
+              f"{len(unexpected)} unused param(s) in checkpoint ignored.")
+    print(f"Loaded real checkpoint: {CHECKPOINT_PATH}")
+else:
+    print(f"WARNING: no checkpoint found at {CHECKPOINT_PATH} — "
+          f"model will run with random, untrained weights.")
+model.eval()
+
 # Pre-generate predictions for all scenarios to make the dashboard fast
 cached_scenarios = {}
-scenario_ids = womd_parser.get_all_scenario_ids()
+scenario_ids = [f"scenario_{i}" for i in range(min(len(dataset), 30))]  # cap for startup time
 
-print("Caching scenario predictions...")
+print(f"Caching real model predictions for {len(scenario_ids)} scenarios...")
 for s_id in scenario_ids:
-    # Get index
     idx = int(s_id.split('_')[-1])
     batch = dataset[idx]
-    
-    # Generate mock dense predictions for visualization
+
     N_agents = len(batch.agent_types)
-    K_modes = 6
-    T_fut = 12
-    
-    predictions = np.zeros((N_agents, K_modes, T_fut, 5)) # x, y, vx, vy, heading
-    confidences = np.zeros((N_agents, K_modes))
-    
-    for n in range(N_agents):
-        # Base straight/turn paths
-        heading = 0.5 if n == 0 else -0.2
-        v = 10.0 if n == 0 else 5.0
-        
-        # SDC start
-        start_x = batch.history_traj[n, -1, 0]
-        start_y = batch.history_traj[n, -1, 1]
-        
-        # Confidences: mode 0 (best) has highest confidence
-        confidences[n] = [0.55, 0.20, 0.10, 0.08, 0.05, 0.02]
-        
-        # Generate K modes trajectories
-        for k in range(K_modes):
-            mode_heading = heading + (k - 2) * 0.15
-            mode_v = v * (1.0 - k * 0.08)
-            for t in range(T_fut):
-                dt_val = (t + 1) * 0.5
-                dx = mode_v * dt_val * np.cos(mode_heading)
-                dy = mode_v * dt_val * np.sin(mode_heading)
-                # vx, vy
-                vx = mode_v * np.cos(mode_heading)
-                vy = mode_v * np.sin(mode_heading)
-                predictions[n, k, t] = [start_x + dx, start_y + dy, vx, vy, mode_heading]
-                
+    T_hist = batch.history_traj.shape[1]
+
+    with torch.no_grad():
+        hist_tensor = torch.from_numpy(batch.history_traj).float().unsqueeze(0).to(DEVICE)   # (1, N, T_hist, 6)
+        map_polylines_batch = [batch.map_polylines]
+        camera_images = batch.camera_image.unsqueeze(0).to(DEVICE) if batch.has_image else None
+        has_image_mask = torch.tensor([1.0 if batch.has_image else 0.0])
+
+        pred_trajs, confidences = model(
+            hist_tensor, map_polylines_batch, hcp_mask=None,
+            camera_images=camera_images, has_image_mask=has_image_mask,
+        )
+        # (1, N, K, T_fut, 5) -> (N, K, T_fut, 5); apply softmax so confidences
+        # are genuine probabilities, matching how they're used for display.
+        predictions = pred_trajs[0].cpu().numpy()
+        confidences = torch.softmax(confidences[0], dim=-1).cpu().numpy()
+
     cached_scenarios[s_id] = {
         "batch": batch,
         "predictions": predictions,
@@ -261,6 +317,12 @@ def run_hcp(s_id: str):
     
     # Convert predictions to torch tensor
     preds_tensor = torch.tensor(preds, dtype=torch.float32)
+    # Smooth before feeding to the pruner — see smooth_trajectory_xy_polyfit's
+    # docstring for why this matters: raw model output has small realistic
+    # point-to-point noise that KFF's jerk check (very sensitive to noise,
+    # due to triple-differencing) would otherwise reject even for genuinely
+    # sensible paths.
+    preds_tensor = smooth_trajectory_xy_polyfit(preds_tensor)
     hist_tensor = torch.tensor(batch.history_traj, dtype=torch.float32)
     
     # Run pruner
@@ -506,10 +568,10 @@ def serve_dashboard():
                     <div>
                         <div class="flex justify-between text-xs mb-1">
                             <span class="text-slate-400">Raw Candidates</span>
-                            <span class="mono font-bold text-slate-300">128 (100%)</span>
+                            <span id="raw-stat" class="mono font-bold text-slate-300">128 (100%)</span>
                         </div>
                         <div class="w-full bg-slate-900/60 h-3 rounded-full overflow-hidden">
-                            <div class="bg-slate-500 h-full w-[100%]"></div>
+                            <div id="raw-bar" class="bg-slate-500 h-full w-[100%]"></div>
                         </div>
                     </div>
                     <div>
@@ -612,6 +674,7 @@ def serve_dashboard():
     <script>
         let LeafletMap = null;
         let LeafletPaths = [];
+        let LeafletMarkers = {};   // agent_id -> Leaflet marker, so streamed frames update position rather than re-creating markers every frame
         let sseSource = null;
         let currentScenarioId = "";
 
@@ -669,6 +732,14 @@ def serve_dashboard():
             if (btnPlay) btnPlay.textContent = "Play Stream";
             const frameCounter = document.getElementById('frame-counter');
             if (frameCounter) frameCounter.textContent = "0 / 12";
+            // Clear the previous scenario's agent markers so switching
+            // scenarios doesn't leave old agents' dots on the new map.
+            if (LeafletMap) {
+                Object.values(LeafletMarkers).forEach(m => {
+                    try { LeafletMap.removeLayer(m); } catch (e) {}
+                });
+            }
+            LeafletMarkers = {};
 
             try {
                 const res = await fetch(`/scenario/${s_id}`);
@@ -798,6 +869,8 @@ def serve_dashboard():
                 const update = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
                 const updateWidth = (id, w) => { const el = document.getElementById(id); if (el) el.style.width = w; };
 
+                update('raw-stat', `${stats.raw_count} (100%)`);
+                updateWidth('raw-bar', `100%`);
                 update('kff-stat', `${stats.kff_count} (${Math.round(stats.kff_count / stats.raw_count * 100)}%)`);
                 updateWidth('kff-bar', `${Math.round(stats.kff_count / stats.raw_count * 100)}%`);
                 update('srf-stat', `${stats.srf_count} (${Math.round(stats.srf_count / stats.raw_count * 100)}%)`);
@@ -834,6 +907,36 @@ def serve_dashboard():
                         const data = JSON.parse(event.data);
                         const fc = document.getElementById('frame-counter');
                         if (fc) fc.textContent = `${(data?.step ?? 0) + 1} / 12`;
+
+                        // Draw/update each agent's real predicted position on the map.
+                        // Previously this handler only updated the frame counter text
+                        // and never touched the map at all — the stream's real data
+                        // was being received correctly but silently discarded.
+                        if (LeafletMap && data && Array.isArray(data.agents)) {
+                            data.agents.forEach(agent => {
+                                if (typeof agent.lat !== 'number' || typeof agent.lng !== 'number') return;
+                                const isEgo = agent.agent_id === 0;
+                                const color = isEgo ? '#10b981' /* emerald, matches Ego Vehicle styling */
+                                            : agent.type === 'pedestrian' ? '#38bdf8' /* sky blue */
+                                            : '#f59e0b' /* amber, other vehicles */;
+
+                                if (LeafletMarkers[agent.agent_id]) {
+                                    // Marker already exists for this agent — just move it.
+                                    LeafletMarkers[agent.agent_id].setLatLng([agent.lat, agent.lng]);
+                                } else {
+                                    // First frame for this agent — create its marker.
+                                    LeafletMarkers[agent.agent_id] = L.circleMarker([agent.lat, agent.lng], {
+                                        radius: isEgo ? 9 : 7,
+                                        color: color,
+                                        fillColor: color,
+                                        fillOpacity: 0.9,
+                                        weight: 2,
+                                    }).addTo(LeafletMap)
+                                      .bindTooltip(isEgo ? 'Ego Vehicle' : `Agent #${agent.agent_id} (${agent.type})`,
+                                                   { permanent: false, direction: 'top' });
+                                }
+                            });
+                        }
                     } catch (e) {}
                 };
                 sseSource.onerror = function() {
@@ -853,6 +956,14 @@ def serve_dashboard():
             if (btn) btn.textContent = "Play Stream";
             const fc = document.getElementById('frame-counter');
             if (fc) fc.textContent = "0 / 12";
+            // Clear agent markers left over from the previous playback so a
+            // fresh run (or a different scenario) doesn't show stale dots.
+            if (LeafletMap) {
+                Object.values(LeafletMarkers).forEach(m => {
+                    try { LeafletMap.removeLayer(m); } catch (e) {}
+                });
+            }
+            LeafletMarkers = {};
         }
     </script>
 </body>
@@ -864,9 +975,12 @@ def serve_dashboard():
 if __name__ == "__main__":
     import uvicorn
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    evaluator = HCPEvaluator(OUTPUT_DIR)
-    evaluator.run_benchmarks()
-    
+    # NOTE: previously called the old (fake) HCPEvaluator().run_benchmarks()
+    # here, which just wrote hardcoded numbers and never touched the model.
+    # That class no longer exists — real evaluation results, from actually
+    # running hcp_project/eval/evaluate.py, already exist as
+    # eval_real_*.json files in OUTPUT_DIR, which /metrics picks up
+    # automatically. No need to regenerate anything at every server startup.
+
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
