@@ -1,6 +1,18 @@
+# Existing
 hcp_project/data/
 *.tgz
 *.pth
 *.pkl
 __pycache__/
 .ipynb_checkpoints/
+
+# Local environment / dependencies (regenerable, machine-specific)
+hcp_env/
+hcp_project/ui/node_modules/
+
+# Dataset archives (too large for git)
+*.zip
+
+# Generated dashboard output artifacts (regenerable by running the app)
+hcp_project/outputs/maps/
+hcp_project/outputs/motion_states/
