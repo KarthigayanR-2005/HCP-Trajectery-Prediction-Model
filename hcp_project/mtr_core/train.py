@@ -347,6 +347,7 @@ def train_model(
     n_modes: int = None,
     anchors_path: str = None,
     mask_in_training: bool = False,
+    split: str = "train",
 ):
     print("Initialising training pipeline …")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -360,7 +361,44 @@ def train_model(
     # Build base dataset router (index-addressable)
     print("Building DatasetRouter (this loads and processes all nuScenes metadata "
           "into trajectory slices — can take a couple of minutes on the full trainval split)...")
-    base_dataset = DatasetRouter(nuscenes_dir, waymo_dir, mode="nuscenes")
+    # ---- Train/validation split ------------------------------------------
+    # This defaults to the official 700-scene TRAIN split, not the whole
+    # dataset. Every run before this one trained on all 850 scenes with nothing
+    # held out, which meant no reported number could be a measure of
+    # generalisation -- the model had seen every scene it was later evaluated
+    # on. The README was candid about this; it is now fixed at the source.
+    #
+    # The split is applied at SCENE level, never at slice level. Consecutive
+    # trajectory slices of one track overlap heavily, so splitting slices at
+    # random would put near-duplicate examples on both sides and leak.
+    scene_filter = None
+    if split != "all":
+        try:
+            from nuscenes.utils.splits import create_splits_scenes
+        except ImportError as exc:
+            raise SystemExit(
+                f"--split {split} needs nuscenes-devkit for the official scene lists "
+                f"({exc}). Install it, or pass --split all to train on everything "
+                f"(and then report no generalisation claim)."
+            )
+        splits = create_splits_scenes()
+        if split not in splits:
+            raise SystemExit(f"Unknown split {split!r}; available: {sorted(splits)}")
+        scene_filter = set(splits[split])
+        print(f"\n{'='*70}")
+        print(f"Training on the official nuScenes '{split}' split "
+              f"({len(scene_filter)} scenes).")
+        print(f"Scenes outside it are held out and never seen during training.")
+        print(f"{'='*70}\n")
+    else:
+        print(f"\n{'='*70}")
+        print("WARNING: --split all -- training on every scene, nothing held out.")
+        print("Numbers from a model trained this way are NOT a measure of")
+        print("generalisation and must not be reported as one.")
+        print(f"{'='*70}\n")
+
+    base_dataset = DatasetRouter(nuscenes_dir, waymo_dir, mode="nuscenes",
+                                 scene_filter=scene_filter)
 
     # High-throughput streaming dataloader
     scenario_indices = list(range(len(base_dataset)))
@@ -640,6 +678,7 @@ def train_model(
                     "scheduler_state_dict": lr_scheduler.state_dict(),
                     "epoch":                epoch,  # chunk in progress, not yet complete
                     "history_loss":         history_loss,
+                    "train_split":          split,
                     "total_steps":          total_steps_trained,
                 }
                 torch.save(ckpt_payload, os.path.join(out_dir, "mtr_checkpoint.pth"))
@@ -695,6 +734,7 @@ def train_model(
                 "scheduler_state_dict": lr_scheduler.state_dict(),
                 "epoch":                final_epoch_number,
                 "history_loss":         history_loss,
+                "train_split":          split,
                 "total_steps":          total_steps_trained,
             }
             epoch_ckpt_path = os.path.join(ckpt_dir, f"mtr_epoch_{final_epoch_number}.pth")
@@ -719,6 +759,7 @@ def train_model(
         "scheduler_state_dict": lr_scheduler.state_dict(),
         "epoch":                start_epoch + epochs,
         "history_loss":         history_loss,
+        "train_split":          split,
         "total_steps":          total_steps_trained,
     }
     torch.save(final_payload, os.path.join(out_dir, "mtr_checkpoint.pth"))
@@ -779,6 +820,12 @@ if __name__ == "__main__":
                              "bug fix or other change invalidates the old plateau "
                              "history, so the model gets real room to adapt rather "
                              "than crawling at an already-decayed-down LR.")
+    parser.add_argument("--split", type=str, default="train",
+                        choices=["train", "val", "all"],
+                        help="Which official nuScenes scene split to train on. "
+                             "Defaults to 'train' (700 scenes), leaving the 150 "
+                             "val scenes genuinely held out. 'all' trains on "
+                             "everything and forfeits any generalisation claim.")
     parser.add_argument("--mask_in_training", action="store_true",
                         help="Apply the HCP mask during training too. Off by default: "
                              "it injects a gradient-free constant into the winner-takes-all "
@@ -822,4 +869,5 @@ if __name__ == "__main__":
         n_modes=args.n_modes,
         anchors_path=args.anchors,
         mask_in_training=args.mask_in_training,
+        split=args.split,
     )

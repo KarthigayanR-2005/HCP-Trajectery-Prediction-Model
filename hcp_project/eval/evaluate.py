@@ -171,6 +171,25 @@ def run_evaluation(checkpoint_path, nuscenes_dir, waymo_dir, num_samples=2000,
     model = MTRMotionTransformer(d_model=256, n_modes=n_modes, anchors=anchors_np).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
     state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+
+    # Cross-check what the checkpoint was trained on against what we are about
+    # to evaluate on. Evaluating on scenes the model trained on is not a
+    # generalisation measure, and it is easy to do by accident.
+    trained_on = ckpt.get("train_split") if isinstance(ckpt, dict) else None
+    if trained_on is None:
+        print("\nNOTE: this checkpoint records no training split. It predates split "
+              "support, which means it was almost certainly trained on all 850 "
+              "scenes -- so nothing below is a generalisation measure.\n")
+    elif trained_on == "all":
+        print("\nWARNING: this checkpoint was trained on ALL scenes. Whatever split "
+              "is evaluated here was seen during training; these numbers cannot "
+              "support a generalisation claim.\n")
+    elif scene_filter_label and trained_on in str(scene_filter_label):
+        print(f"\nWARNING: evaluating on the '{trained_on}' split, which is the split "
+              f"this checkpoint was TRAINED on. These are training-set numbers.\n")
+    else:
+        print(f"\nCheckpoint was trained on the '{trained_on}' split; "
+              f"evaluating on '{scene_filter_label or 'all scenes'}'.\n")
     missing, unexpected, skipped = load_state_dict_forgiving(
         model, state_dict, context=f"evaluating {os.path.basename(checkpoint_path)}")
     if missing or unexpected:
@@ -274,6 +293,11 @@ if __name__ == "__main__":
     parser.add_argument("--compare_hcp", action="store_true",
                          help="Run twice — once with HCP pruning, once without — "
                               "and print both, for the real Ours-vs-baseline comparison.")
+    parser.add_argument("--split", type=str, default=None,
+                         choices=["train", "val", "all"],
+                         help="Which official nuScenes scene split to evaluate on. "
+                              "Use 'val' for a genuine held-out measurement of a "
+                              "checkpoint trained with --split train.")
     parser.add_argument("--val_split_only", action="store_true",
                          help="Restrict evaluation to the official nuScenes val split "
                               "(150 scenes) via nuscenes-devkit's create_splits_scenes(). "
@@ -286,7 +310,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     scene_filter, scene_filter_label = None, None
-    if args.val_split_only:
+    if args.split and args.split != "all":
+        from nuscenes.utils.splits import create_splits_scenes
+        scene_filter = set(create_splits_scenes()[args.split])
+        scene_filter_label = f"official nuScenes {args.split} split"
+        print(f"Evaluating on the official '{args.split}' split "
+              f"({len(scene_filter)} scenes).")
+    elif args.val_split_only:
         from nuscenes.utils.splits import create_splits_scenes
         scene_filter = set(create_splits_scenes()["val"])
         scene_filter_label = "official nuScenes val split"
