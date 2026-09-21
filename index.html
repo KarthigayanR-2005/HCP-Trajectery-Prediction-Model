@@ -165,10 +165,10 @@
                             <span class="text-slate-400 flex items-center gap-1.5">
                                 <span class="w-2 h-2 bg-slate-500 rounded-full"></span> Stage 1: KFF (Kinematic)
                             </span>
-                            <span id="kff-stat" class="mono font-bold text-slate-300">74 (58%)</span>
+                            <span id="kff-stat" class="mono font-bold text-slate-300">—</span>
                         </div>
                         <div class="w-full bg-slate-900/60 h-3 rounded-full overflow-hidden">
-                            <div id="kff-bar" class="bg-slate-500 h-full w-[58%] transition-all duration-500"></div>
+                            <div id="kff-bar" class="bg-slate-500 h-full w-[0%] transition-all duration-500"></div>
                         </div>
                     </div>
                     <div>
@@ -176,10 +176,10 @@
                             <span class="text-slate-400 flex items-center gap-1.5">
                                 <span class="w-2 h-2 bg-secondary rounded-full"></span> Stage 2: SRF (Spatial)
                             </span>
-                            <span id="srf-stat" class="mono font-bold text-slate-300">31 (24%)</span>
+                            <span id="srf-stat" class="mono font-bold text-slate-300">—</span>
                         </div>
                         <div class="w-full bg-slate-900/60 h-3 rounded-full overflow-hidden">
-                            <div id="srf-bar" class="bg-secondary h-full w-[24%] transition-all duration-500"></div>
+                            <div id="srf-bar" class="bg-secondary h-full w-[0%] transition-all duration-500"></div>
                         </div>
                     </div>
                     <div>
@@ -187,25 +187,25 @@
                             <span class="text-slate-400 flex items-center gap-1.5">
                                 <span class="w-2 h-2 bg-accent rounded-full"></span> Stage 3: SCF (Social)
                             </span>
-                            <span id="scf-stat" class="mono font-bold text-accent">9 (7%)</span>
+                            <span id="scf-stat" class="mono font-bold text-accent">—</span>
                         </div>
                         <div class="w-full bg-slate-900/60 h-3 rounded-full overflow-hidden">
-                            <div id="scf-bar" class="bg-accent h-full w-[7%] transition-all duration-500"></div>
+                            <div id="scf-bar" class="bg-accent h-full w-[0%] transition-all duration-500"></div>
                         </div>
                     </div>
                 </div>
 
                 <!-- Latency Dial -->
                 <div class="mt-5 flex flex-col items-center glass-card p-4">
-                    <span class="text-[9px] text-slate-500 uppercase font-bold tracking-widest mb-2">Inference Latency</span>
+                    <span class="text-[9px] text-slate-500 uppercase font-bold tracking-widest mb-2">Pruner Stage Time</span>
                     <div class="relative flex items-center justify-center w-24 h-24">
                         <svg class="w-full h-full transform -rotate-90" viewBox="0 0 36 36">
                             <path class="text-slate-800" stroke-width="3" stroke="currentColor" fill="none" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
-                            <path id="dial-value" class="text-accent transition-all duration-500" stroke-dasharray="80, 100" stroke-width="3" stroke-linecap="round" stroke="currentColor" fill="none" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+                            <path id="dial-value" class="text-accent transition-all duration-500" stroke-dasharray="0, 100" stroke-width="3" stroke-linecap="round" stroke="currentColor" fill="none" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
                         </svg>
                         <div class="absolute flex flex-col items-center">
-                            <span id="latency-ms" class="text-xl font-black mono text-white">32.5ms</span>
-                            <span class="text-[8px] uppercase tracking-widest text-slate-500 font-semibold">Real-Time</span>
+                            <span id="latency-ms" class="text-xl font-black mono text-white">—</span>
+                            <span class="text-[8px] uppercase tracking-widest text-slate-500 font-semibold">Not measured</span>
                         </div>
                     </div>
                 </div>
@@ -215,11 +215,11 @@
             <div class="grid grid-cols-2 gap-2.5 border-t border-slate-800/40 pt-3">
                 <div class="glass-card p-2.5 text-center">
                     <span class="text-[9px] text-slate-500 uppercase block mb-0.5 tracking-wider font-semibold">Pruning Ratio</span>
-                    <span id="pruning-ratio" class="text-base font-black text-accent mono">76.0%</span>
+                    <span id="pruning-ratio" class="text-base font-black text-accent mono">—</span>
                 </div>
                 <div class="glass-card p-2.5 text-center">
-                    <span class="text-[9px] text-slate-500 uppercase block mb-0.5 tracking-wider font-semibold">Latency Saved</span>
-                    <span id="latency-saved" class="text-base font-black text-secondary mono">71.8%</span>
+                    <span class="text-[9px] text-slate-500 uppercase block mb-0.5 tracking-wider font-semibold">Pruner Overhead</span>
+                    <span id="latency-saved" class="text-base font-black text-secondary mono">—</span>
                 </div>
             </div>
         </div>
@@ -446,14 +446,14 @@
         }
 
         async function triggerHCPRun() {
-            let stats = {
-                kff_count: 74, raw_count: 128, srf_count: 31, scf_count: 9,
-                total_time_ms: 32.5, pruning_ratio: 0.76, latency_reduction_pct: 71.8
-            };
+            // No fabricated fallback: if the backend is unreachable the panel
+            // stays blank rather than displaying numbers nobody measured.
+            let stats = null;
             try {
                 const res = await fetch(`/run_hcp/${currentScenarioId}`, { method: 'POST' });
                 if (res.ok) stats = await res.json();
             } catch (err) {}
+            if (!stats) return;
 
             const update = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
             const updateWidth = (id, w) => { const el = document.getElementById(id); if (el) el.style.width = w; };
@@ -466,7 +466,10 @@
             updateWidth('scf-bar', `${Math.round(stats.scf_count / stats.raw_count * 100)}%`);
             update('latency-ms', `${stats.total_time_ms.toFixed(1)}ms`);
             update('pruning-ratio', `${(stats.pruning_ratio * 100).toFixed(1)}%`);
-            update('latency-saved', `${stats.latency_reduction_pct.toFixed(1)}%`);
+            // The pruner deliberately no longer reports a latency reduction: masking
+            // does not currently skip any decoder computation, so there is none to
+            // report. Show the pruner's own measured cost instead.
+            update('latency-saved', `${stats.total_time_ms.toFixed(1)}ms`);
 
             const mapEl = document.getElementById('leaflet-map');
             if (mapEl) {

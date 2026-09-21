@@ -31,25 +31,59 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 from hcp_project.data.dataset_router import DatasetRouter
 from hcp_project.data.dataset_streamer import build_streaming_dataloader
-from hcp_project.mtr_core.train import MTRMotionTransformer
-from hcp_project.hcp.pruner import HierarchicalCombinatorialPruner, generate_kinematic_candidates
+from hcp_project.mtr_core.train import MTRMotionTransformer, load_state_dict_forgiving
+from hcp_project.hcp.pruner import (
+    HierarchicalCombinatorialPruner, generate_kinematic_candidates,
+    generate_anchor_candidates,
+)
 
 
-def compute_ade_fde_mr(predictions, ground_truth, miss_threshold=2.0):
+def compute_ade_fde_mr(predictions, ground_truth, miss_threshold=2.0, confidences=None):
     """
     predictions : (N, K, T, 2)
     ground_truth: (N, T, 2)
-    Returns per-agent arrays (ades, fdes, is_miss) — NOT yet averaged, so the
-    caller can accumulate across many batches before computing final stats.
+    confidences : (N, K) or None. A mode with confidence exactly 0 was pruned by
+                  HCP and never predicted, so it must not be scored.
+
+    Returns per-agent arrays (ades, fdes, is_miss, n_modes_used) — NOT yet
+    averaged, so the caller can accumulate across batches.
+
+    Why confidences matter here
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    This function used to take the minimum over ALL K modes and ignore
+    confidence entirely. That made minADE/minFDE/miss-rate mathematically
+    incapable of responding to pruning: the HCP mask only ever touched
+    confidence, so both configurations produced byte-identical numbers (see
+    eval_real_20260910_163553.json, where "Ours" and the baseline agree to every
+    decimal place). That is not a null result about pruning -- it is the metric
+    being blind to it by construction.
+
+    Scoring only the modes a configuration actually predicted is what makes the
+    accuracy half of the project's research question measurable at all.
     """
     N, K, T, _ = predictions.shape
     dists = np.linalg.norm(predictions - ground_truth[:, None, :, :], axis=-1)  # (N, K, T)
     mode_ade = dists.mean(axis=-1)   # (N, K)
     mode_fde = dists[:, :, -1]       # (N, K)
+
+    if confidences is not None:
+        alive = confidences > 0.0                     # (N, K)
+        # An agent with nothing left alive keeps its best mode, matching the
+        # pruner's own "at least one survivor" fallback.
+        none_alive = ~alive.any(axis=1)
+        if none_alive.any():
+            alive = alive.copy()
+            alive[none_alive, 0] = True
+        mode_ade = np.where(alive, mode_ade, np.inf)
+        mode_fde = np.where(alive, mode_fde, np.inf)
+        n_modes_used = alive.sum(axis=1).astype(np.float32)
+    else:
+        n_modes_used = np.full((N,), float(K), dtype=np.float32)
+
     min_ade = mode_ade.min(axis=1)   # (N,)
     min_fde = mode_fde.min(axis=1)   # (N,)
     is_miss = (min_fde > miss_threshold).astype(np.float32)
-    return min_ade, min_fde, is_miss
+    return min_ade, min_fde, is_miss, n_modes_used
 
 
 def build_batch_tensors(collated, device):
@@ -88,13 +122,17 @@ def build_batch_tensors(collated, device):
     return hist_padded, fut_padded, camera_images, has_image_mask, map_polylines_batch, batch_splits
 
 
-def build_hcp_mask(fut_padded, hist_padded, map_polylines_batch, batch_splits, pruner, device):
+def build_hcp_mask(fut_padded, hist_padded, map_polylines_batch, batch_splits, pruner,
+                   device, anchors):
+    """Candidates are generated from the decoder's own anchors so that candidate k
+    and decoder mode k are the same manoeuvre -- see generate_anchor_candidates."""
     B, N_max, T_fut, _ = fut_padded.shape
-    dense_candidates = torch.zeros((B, N_max, 6, T_fut, 5), device=device)
+    K = anchors.shape[0]
+    dense_candidates = torch.zeros((B, N_max, K, T_fut, 5), device=device)
     for b in range(B):
         for n in range(batch_splits[b]):
-            dense_candidates[b, n] = generate_kinematic_candidates(
-                hist_padded[b, n], T_fut=T_fut, dt=0.5, K=6)
+            dense_candidates[b, n] = generate_anchor_candidates(
+                hist_padded[b, n], anchors, T_fut=T_fut, dt=0.5)
     hcp_masks = []
     for b in range(B):
         _, mask, _ = pruner(
@@ -104,14 +142,15 @@ def build_hcp_mask(fut_padded, hist_padded, map_polylines_batch, batch_splits, p
         )
         pad_rows = N_max - batch_splits[b]
         if pad_rows > 0:
-            mask = torch.cat([mask, torch.zeros((pad_rows, 6), dtype=torch.bool, device=device)], dim=0)
+            mask = torch.cat([mask, torch.zeros((pad_rows, K), dtype=torch.bool, device=device)], dim=0)
         hcp_masks.append(mask)
     return torch.stack(hcp_masks)
 
 
 def run_evaluation(checkpoint_path, nuscenes_dir, waymo_dir, num_samples=2000,
                     batch_size=2, use_hcp=True, device=None, num_workers=0,
-                    scene_filter=None, scene_filter_label=None):
+                    scene_filter=None, scene_filter_label=None,
+                    n_modes=6, anchors_path=None):
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running on: {device}")
 
@@ -128,18 +167,23 @@ def run_evaluation(checkpoint_path, nuscenes_dir, waymo_dir, num_samples=2000,
     )
 
     print(f"Loading model from checkpoint: {checkpoint_path}")
-    model = MTRMotionTransformer(d_model=256, n_modes=6).to(device)
+    anchors_np = np.load(anchors_path) if anchors_path else None
+    model = MTRMotionTransformer(d_model=256, n_modes=n_modes, anchors=anchors_np).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
     state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected, skipped = load_state_dict_forgiving(
+        model, state_dict, context=f"evaluating {os.path.basename(checkpoint_path)}")
     if missing or unexpected:
         print(f"Note: {len(missing)} param(s) not found in checkpoint (fresh-initialised), "
               f"{len(unexpected)} unused param(s) in checkpoint ignored.")
+    if skipped:
+        print("Evaluating a checkpoint with freshly-initialised layers will produce "
+              "meaningless metrics. Retrain before trusting anything below.")
     model.eval()
 
     pruner = HierarchicalCombinatorialPruner().to(device) if use_hcp else None
 
-    all_ades, all_fdes, all_misses = [], [], []
+    all_ades, all_fdes, all_misses, all_modes_used = [], [], [], []
     n_evaluated = 0
     latencies_ms = []
 
@@ -152,7 +196,9 @@ def run_evaluation(checkpoint_path, nuscenes_dir, waymo_dir, num_samples=2000,
 
             hcp_mask = None
             if use_hcp:
-                hcp_mask = build_hcp_mask(fut_padded, hist_padded, map_polylines_batch, batch_splits, pruner, device)
+                hcp_mask = build_hcp_mask(fut_padded, hist_padded, map_polylines_batch,
+                                          batch_splits, pruner, device,
+                                          model.decoder.intention_anchors)
 
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -171,15 +217,18 @@ def run_evaluation(checkpoint_path, nuscenes_dir, waymo_dir, num_samples=2000,
 
             pred_np = pred_trajs[..., :2].cpu().numpy()   # (B, N_max, K, T, 2)
             gt_np   = fut_padded[..., :2].cpu().numpy()   # (B, N_max, T, 2)
+            conf_np = confidences.cpu().numpy()            # (B, N_max, K)
 
             for b in range(B):
                 n = batch_splits[b]
                 if n == 0:
                     continue
-                ades, fdes, misses = compute_ade_fde_mr(pred_np[b, :n], gt_np[b, :n])
+                ades, fdes, misses, modes_used = compute_ade_fde_mr(
+                    pred_np[b, :n], gt_np[b, :n], confidences=conf_np[b, :n])
                 all_ades.extend(ades.tolist())
                 all_fdes.extend(fdes.tolist())
                 all_misses.extend(misses.tolist())
+                all_modes_used.extend(modes_used.tolist())
                 n_evaluated += n
 
             if step_idx % 50 == 0:
@@ -201,6 +250,7 @@ def run_evaluation(checkpoint_path, nuscenes_dir, waymo_dir, num_samples=2000,
         "miss_rate_2m": float(np.mean(all_misses)) if all_misses else None,
         "num_agents_evaluated": n_evaluated,
         "avg_latency_ms_per_agent": float(np.mean(latencies_ms)) if latencies_ms else None,
+        "avg_modes_scored": float(np.mean(all_modes_used)) if all_modes_used else None,
         "hcp_pruning_used": use_hcp,
         "checkpoint": checkpoint_path,
         "scene_filter_used": scene_filter_label,
@@ -217,6 +267,10 @@ if __name__ == "__main__":
     parser.add_argument("--num_samples", type=int, default=2000,
                          help="Number of individual agent trajectories to evaluate on.")
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--n_modes", type=int, default=6,
+                         help="Must match the trained checkpoint.")
+    parser.add_argument("--anchors", type=str, default=None,
+                         help="Path to the same .npy anchor bank the checkpoint was trained with.")
     parser.add_argument("--compare_hcp", action="store_true",
                          help="Run twice — once with HCP pruning, once without — "
                               "and print both, for the real Ours-vs-baseline comparison.")
@@ -254,6 +308,7 @@ if __name__ == "__main__":
             args.checkpoint, args.nuscenes_dir, args.waymo_dir,
             num_samples=args.num_samples, batch_size=args.batch_size, use_hcp=use_hcp,
             scene_filter=scene_filter, scene_filter_label=scene_filter_label,
+            n_modes=args.n_modes, anchors_path=args.anchors,
         )
         all_results[name] = result
         print(f"minADE: {result['minADE']:.4f} | minFDE: {result['minFDE']:.4f} | "

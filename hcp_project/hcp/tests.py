@@ -86,7 +86,16 @@ class TestHCPModule(unittest.TestCase):
         sparse, mask, stats = pruner(traj, hist, map_polylines)
         self.assertEqual(len(sparse), 2)
         self.assertIn("pruning_ratio", stats)
-        self.assertIn("latency_reduction_pct", stats)
+        # latency_reduction_pct was REMOVED from the pruner's stats dict: it was
+        # a hardcoded placeholder that no code ever measured, and the decoder
+        # currently evaluates all K modes regardless of the mask, so there is no
+        # latency reduction to report. Assert it stays gone rather than
+        # asserting it is present.
+        self.assertNotIn("latency_reduction_pct", stats)
+        self.assertNotIn("accuracy_retention_pct", stats)
+        # What the pruner does measure is its own wall-clock cost per stage.
+        for key in ("total_time_ms", "kff_time_ms", "srf_time_ms", "scf_time_ms"):
+            self.assertIn(key, stats)
 
 if __name__ == "__main__":
     unittest.main()

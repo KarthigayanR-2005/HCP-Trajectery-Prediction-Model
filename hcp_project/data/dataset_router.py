@@ -195,12 +195,41 @@ class DatasetRouter(Dataset):
         self.nuscenes_data = self.nuscenes_parser.process_dataset()
         print(f"DatasetRouter: {len(self.nuscenes_data)} nuScenes trajectory slices ready.")
         self.waymo_ids     = self.womd_parser.get_all_scenario_ids()
+
+        # Fail fast and say why, instead of handing back an empty dataset that
+        # only blows up later inside a worker process.
+        if self.mode == "nuscenes" and len(self.nuscenes_data) == 0:
+            raise RuntimeError(
+                f"No nuScenes trajectory slices were produced from "
+                f"{nuscenes_dir!r}. Check that the metadata was extracted "
+                f"(`python hcp_project/data/extractor.py --extract`) and that "
+                f"the path points at the directory containing v1.0-trainval/."
+                + (f" A scene_filter of {len(scene_filter)} scene(s) was applied, "
+                   f"which may have excluded everything."
+                   if scene_filter else "")
+            )
+        if self.mode == "waymo" and len(self.waymo_ids) == 0:
+            raise RuntimeError(
+                f"No Waymo scenarios found in {waymo_dir!r}. Note that no real "
+                f"Waymo data has ever been downloaded for this project; the "
+                f"WOMD path is a placeholder."
+            )
+
         print("DatasetRouter: initialization complete.")
 
     # ------------------------------------------------------------------
     def __len__(self):
+        """Number of trajectory slices available.
+
+        This used to return ``max(len(self.nuscenes_data), 10)``. With no data
+        loaded that reported 10 phantom samples, and __getitem__ then divided
+        by ``len(self.nuscenes_data)`` == 0 and raised ZeroDivisionError deep
+        inside a DataLoader worker. An empty dataset is a configuration error
+        (wrong --nuscenes_dir, extractor not run) and should surface as one at
+        construction time, not as a confusing crash mid-epoch.
+        """
         if self.mode == "nuscenes":
-            return max(len(self.nuscenes_data), 10)
+            return len(self.nuscenes_data)
         return len(self.waymo_ids)
 
     # ------------------------------------------------------------------
@@ -221,7 +250,16 @@ class DatasetRouter(Dataset):
     # nuScenes branch
     # ------------------------------------------------------------------
     def _get_nuscenes(self, idx):
-        item        = self.nuscenes_data[idx % len(self.nuscenes_data)]
+        # Previously ``self.nuscenes_data[idx % len(...)]``. Wrapping turned an
+        # out-of-range index into a silently different sample rather than an
+        # error, which hid indexing bugs (see the streamer's position-vs-id
+        # bug) instead of surfacing them.
+        if not 0 <= idx < len(self.nuscenes_data):
+            raise IndexError(
+                f"scenario index {idx} out of range for "
+                f"{len(self.nuscenes_data)} nuScenes trajectory slices"
+            )
+        item        = self.nuscenes_data[idx]
         scenario_id = f"nuscenes_scene_{idx}"
 
         ego_pose = item["ego_pose"]

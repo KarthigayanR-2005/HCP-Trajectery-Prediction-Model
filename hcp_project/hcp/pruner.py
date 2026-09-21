@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np   # used by the __main__ smoke test below
 import math
 import time
 try:
@@ -63,6 +64,87 @@ def generate_kinematic_candidates(hist, T_fut=12, dt=0.5, K=6):
             candidates[k, t, 3] = vy
             candidates[k, t, 4] = heading
     return candidates
+
+
+def generate_anchor_candidates(hist, anchors, T_fut=12, dt=0.5):
+    """Build one candidate trajectory per intention anchor, index-aligned.
+
+    THIS IS THE FIX FOR THE MODE-VOCABULARY MISMATCH.
+    ------------------------------------------------
+    ``generate_kinematic_candidates`` (below) builds candidates from a bank of
+    constant turn rates, while MTRDecoder indexes its modes by intention anchor.
+    Those are different orderings of different things, so an HCP mask computed
+    over candidate k suppressed decoder anchor k -- a completely unrelated
+    manoeuvre. Measured with the old defaults, pruner candidate 2 was a RIGHT
+    turn while decoder anchor 2 was a LEFT turn: the pruning signal was close to
+    anti-correlated with what the filters actually decided.
+
+    Generating candidates FROM the anchors makes candidate k and mode k the same
+    manoeuvre by construction, so the mismatch cannot recur.
+
+    Shape of each candidate: a cubic Hermite curve in the agent's own frame,
+    leaving the agent's current position at its current speed along its current
+    heading, and arriving at the anchor point travelling along the anchor's
+    bearing. That keeps candidates smooth enough for KFF's curvature and jerk
+    checks to mean something, unlike a straight line to the target.
+
+    Args:
+        hist   : (T_hist, 6) scene-frame history [x, y, vx, vy, heading, type].
+        anchors: (K, 2) anchor endpoints in the AGENT's local frame
+                 (agent at origin facing +x) -- MTRDecoder.intention_anchors.
+        T_fut, dt: horizon length and step.
+
+    Returns:
+        (K, T_fut, 5) scene-frame candidates [x, y, vx, vy, heading], with
+        candidate k corresponding to anchor k.
+    """
+    device, dtype = hist.device, hist.dtype
+    anchors = torch.as_tensor(anchors, dtype=dtype, device=device)
+    K = anchors.shape[0]
+
+    last = hist[-1]
+    x0, y0 = last[0], last[1]
+    th = last[4]
+    speed = torch.sqrt(last[2] ** 2 + last[3] ** 2)
+
+    total_t = T_fut * dt
+    s = torch.linspace(1.0 / T_fut, 1.0, T_fut, device=device, dtype=dtype)  # (T,)
+
+    # Hermite basis on s
+    s2, s3 = s * s, s * s * s
+    h00 = 2 * s3 - 3 * s2 + 1
+    h10 = s3 - 2 * s2 + s
+    h01 = -2 * s3 + 3 * s2
+    h11 = s3 - s2
+
+    # Endpoints in LOCAL frame: start at origin heading +x.
+    p1 = anchors                                         # (K, 2)
+    m0 = torch.stack([speed * total_t, torch.zeros_like(speed)])   # (2,)
+    m0 = m0.unsqueeze(0).expand(K, 2)                     # (K, 2)
+    # Terminal tangent points along the anchor's own bearing.
+    norm = torch.linalg.norm(p1, dim=-1, keepdim=True).clamp_min(1e-6)
+    m1 = p1 / norm * norm                                 # magnitude = |anchor|
+
+    hb = lambda h: h.view(1, T_fut, 1)
+    pos = (hb(h00) * 0.0
+           + hb(h10) * m0.unsqueeze(1)
+           + hb(h01) * p1.unsqueeze(1)
+           + hb(h11) * m1.unsqueeze(1))                   # (K, T, 2), local
+
+    # Velocity via finite difference (same convention the filters assume).
+    prev = torch.cat([torch.zeros(K, 1, 2, device=device, dtype=dtype), pos[:, :-1]], dim=1)
+    vel = (pos - prev) / dt                               # (K, T, 2), local
+    heading_local = torch.atan2(vel[..., 1], vel[..., 0])  # (K, T)
+
+    # Local -> scene frame: rotate by the agent's heading, translate to it.
+    cos_t, sin_t = torch.cos(th), torch.sin(th)
+    x = pos[..., 0] * cos_t - pos[..., 1] * sin_t + x0
+    y = pos[..., 0] * sin_t + pos[..., 1] * cos_t + y0
+    vx = vel[..., 0] * cos_t - vel[..., 1] * sin_t
+    vy = vel[..., 0] * sin_t + vel[..., 1] * cos_t
+    heading = heading_local + th
+
+    return torch.stack([x, y, vx, vy, heading], dim=-1)   # (K, T, 5)
 
 
 class HierarchicalCombinatorialPruner(nn.Module):

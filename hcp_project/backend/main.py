@@ -9,6 +9,7 @@ import torch
 import matplotlib
 matplotlib.use('Agg')
 from fastapi import FastAPI, Response, HTTPException
+from pydantic import BaseModel
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -24,28 +25,21 @@ from mtr_core.train import MTRMotionTransformer
 # ---------------------------------------------------------------------------
 # Geo helpers — convert ego-centric metres to geographic coords for map UI
 # ---------------------------------------------------------------------------
-SCENARIO_ANCHORS = [
-    {"lat": 37.7749, "lng": -122.4194, "city": "San Francisco"},
-    {"lat": 40.7580, "lng": -73.9855, "city": "New York"},
-    {"lat": 51.5074, "lng": -0.1278, "city": "London"},
-    {"lat": 48.8566, "lng": 2.3522, "city": "Paris"},
-    {"lat": 35.6762, "lng": 139.6503, "city": "Tokyo"},
-    {"lat": 1.2903, "lng": 103.8520, "city": "Singapore"},
-    {"lat": -33.8688, "lng": 151.2093, "city": "Sydney"},
-    {"lat": 52.5200, "lng": 13.4050, "city": "Berlin"},
-    {"lat": 55.7558, "lng": 37.6173, "city": "Moscow"},
-    {"lat": 34.0522, "lng": -118.2437, "city": "Los Angeles"},
-    {"lat": 43.6532, "lng": -79.3832, "city": "Toronto"},
-    {"lat": 25.2048, "lng": 55.2708, "city": "Dubai"},
-    {"lat": 41.9028, "lng": 12.4964, "city": "Rome"},
-    {"lat": -23.5505, "lng": -46.6333, "city": "São Paulo"},
-    {"lat": 19.4326, "lng": -99.1332, "city": "Mexico City"},
-]
+# Previously this cycled through 15 fictional city anchors (San Francisco,
+# Tokyo, Paris, etc.) purely for cosmetic variety — but the actual
+# trajectory/prediction data always comes from the real nuScenes
+# 'singapore-onenorth' map (see NuScenesMapWrapper), which has no real
+# connection to any of those other cities' road networks. Dropping real
+# Singapore movement data onto e.g. a San Francisco street grid meant
+# predicted paths never aligned with real roads except for the 1-in-15
+# scenarios that happened to land on the Singapore anchor. Fixed: every
+# scenario now anchors to the same real Singapore location the map data
+# actually represents, so drawn trajectories genuinely trace real streets.
+REAL_SINGAPORE_ANCHOR = {"lat": 1.290270, "lng": 103.851959, "city": "Singapore"}
 
 def _get_anchor(scenario_id: str) -> dict:
-    """Deterministic per-scenario city anchor."""
-    idx = int(scenario_id.split('_')[-1]) if '_' in scenario_id else 0
-    return SCENARIO_ANCHORS[idx % len(SCENARIO_ANCHORS)]
+    """Real anchor matching the actual nuScenes 'singapore-onenorth' map data."""
+    return REAL_SINGAPORE_ANCHOR
 
 def _metres_to_geo(x_m: float, y_m: float, anchor_lat: float, anchor_lng: float):
     """Convert ego-centric metres offset → (lng, lat)."""
@@ -174,7 +168,13 @@ for s_id in scenario_ids:
         # (1, N, K, T_fut, 5) -> (N, K, T_fut, 5); apply softmax so confidences
         # are genuine probabilities, matching how they're used for display.
         predictions = pred_trajs[0].cpu().numpy()
-        confidences = torch.softmax(confidences[0], dim=-1).cpu().numpy()
+        # MTRDecoder.forward already returns F.softmax(conf_logits, dim=-1), so
+        # these are ALREADY probabilities. The previous torch.softmax() here was a
+        # second softmax over a probability vector, which flattens it toward
+        # uniform: a decisive [0.77, 0.06, 0.05, ...] was displayed as
+        # [0.29, 0.14, 0.14, ...]. argmax survived, so the right mode was still
+        # selected, but every confidence percentage shown was wrong.
+        confidences = confidences[0].cpu().numpy()
 
     cached_scenarios[s_id] = {
         "batch": batch,
@@ -329,19 +329,108 @@ def run_hcp(s_id: str):
     _, _, stats = pruner(preds_tensor, hist_tensor, batch.map_polylines)
     return stats
 
+class InjectAgentRequest(BaseModel):
+    x: float
+    y: float
+    heading_deg: float
+    speed_mps: float
+    agent_type: str = "vehicle"
+
+# Human-readable labels for generate_kinematic_candidates' fixed turn-rate
+# bank ([0.0, 0.12, -0.12, 0.25, -0.25, 0.40] rad/s), for display only.
+_KINEMATIC_CANDIDATE_LABELS = [
+    "Straight", "Slight Left", "Slight Right",
+    "Moderate Left", "Moderate Right", "Sharp Left",
+]
+
+@app.post("/inject_agent/{s_id}")
+def inject_agent(s_id: str, req: InjectAgentRequest):
+    """
+    Adds a user-placed synthetic agent and predicts its future using
+    physics-based extrapolation (generate_kinematic_candidates) — NOT the
+    trained MTR transformer, which was trained on this scenario's fixed
+    real-agent batch and can't have a new agent spliced into it without a
+    full batch rebuild. What this DOES do honestly: the synthetic agent's
+    6 candidate paths are run through the real, unmodified HCP pruner
+    (KFF/SRF/SCF) together with this scenario's real map geometry and real
+    other agents, so its feasibility/collision checks are genuine, even
+    though its trajectory prediction itself is kinematic, not learned.
+    """
+    if s_id not in cached_scenarios:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+
+    cache = cached_scenarios[s_id]
+    batch = cache["batch"]
+    real_preds = cache["predictions"]          # (N, K, T_fut, 5)
+    real_hist = batch.history_traj             # (N, T_hist, 6)
+
+    T_hist = real_hist.shape[1]
+    T_fut = real_preds.shape[2]
+    K = real_preds.shape[1]
+
+    heading_rad = math.radians(req.heading_deg)
+    vx0 = req.speed_mps * math.cos(heading_rad)
+    vy0 = req.speed_mps * math.sin(heading_rad)
+
+    # generate_kinematic_candidates only ever reads the LAST row of hist
+    # (see its docstring) — so a single real state (the click position +
+    # the speed/heading you set) is all it actually needs. We repeat that
+    # one row across T_hist purely to match this batch's tensor shape; it
+    # is not a claim about the injected agent's real past movement.
+    synth_row = torch.tensor([req.x, req.y, vx0, vy0, heading_rad, 0.0], dtype=torch.float32)
+    synth_hist = synth_row.unsqueeze(0).repeat(T_hist, 1)  # (T_hist, 6)
+
+    synth_candidates = generate_kinematic_candidates(synth_hist, T_fut=T_fut, dt=0.5, K=K)  # (K, T_fut, 5)
+
+    # Combine with the real batch so SRF (real road geometry) and SCF (real
+    # other agents) genuinely check the injected agent against everything
+    # actually present in this scenario, not in isolation.
+    real_preds_tensor = torch.tensor(real_preds, dtype=torch.float32)
+    combined_traj = torch.cat([real_preds_tensor, synth_candidates.unsqueeze(0)], dim=0)   # (N+1, K, T_fut, 5)
+
+    real_hist_tensor = torch.tensor(real_hist, dtype=torch.float32)
+    combined_hist = torch.cat([real_hist_tensor, synth_hist.unsqueeze(0)], dim=0)          # (N+1, T_hist, 6)
+
+    _, composite_mask, _ = pruner(combined_traj, combined_hist, batch.map_polylines)
+
+    injected_idx = combined_traj.shape[0] - 1
+    survived = composite_mask[injected_idx].tolist()  # (K,) bools — real per-candidate pruner verdict
+
+    return {
+        "agent_type": req.agent_type,
+        "origin": {"x": req.x, "y": req.y, "heading_deg": req.heading_deg, "speed_mps": req.speed_mps},
+        "candidates": synth_candidates[:, :, :2].tolist(),  # (K, T_fut, [x, y]) — real local ego-centric frame
+        "survived": survived,
+        "labels": _KINEMATIC_CANDIDATE_LABELS[:K],
+    }
+
 @app.get("/metrics")
 def get_metrics():
-    # Load evaluation table JSON
-    files = glob.glob(os.path.join(OUTPUT_DIR, "eval_*.json"))
+    """Return the most recent REAL evaluation output.
+
+    This endpoint used to fall back to a hardcoded dict (minADE5 0.81,
+    32.5ms vs 115.2ms, 76% pruning). Those numbers were never measured by
+    anything in this project, and serving them from a "/metrics" endpoint
+    presented them as live telemetry. There is now no fallback: with no
+    evaluation on disk the endpoint says so, and the dashboard renders an
+    empty state rather than fiction.
+
+    Note the glob is eval_real_*.json, not eval_*.json -- the latter also
+    matched the old fabricated eval_20260722_220509.json.
+    """
+    files = glob.glob(os.path.join(OUTPUT_DIR, "eval_real_*.json"))
     if not files:
-        # Fallback values
         return {
-            "Ours (HCP + MTR)": {"minADE5": 0.81, "minFDE5": 1.54, "latency_ms": 32.5, "pruning_ratio": 0.76},
-            "No-HCP (MTR Baseline)": {"minADE5": 0.78, "minFDE5": 1.48, "latency_ms": 115.2, "pruning_ratio": 0.0}
+            "available": False,
+            "detail": ("No evaluation results on disk. Run "
+                       "`python hcp_project/eval/evaluate.py --checkpoint "
+                       "hcp_project/outputs/mtr_checkpoint.pth --compare_hcp` "
+                       "to produce them."),
         }
     latest_file = max(files, key=os.path.getctime)
     with open(latest_file, 'r') as f:
-        return json.load(f)
+        payload = json.load(f)
+    return {"available": True, "source": os.path.basename(latest_file), "results": payload}
 
 @app.get("/stream/{s_id}")
 def stream_scenario(s_id: str):
@@ -431,9 +520,6 @@ def serve_dashboard():
     </script>
     <!-- Google Fonts -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=Outfit:wght@400;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
-    <!-- Leaflet.js -->
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <style>
         body {
             font-family: 'Inter', sans-serif;
@@ -446,7 +532,7 @@ def serve_dashboard():
         .mono {
             font-family: 'JetBrains Mono', monospace;
         }
-        #leaflet-map {
+        #scene-map {
             height: 100%;
             width: 100%;
             background-color: #0d131a;
@@ -477,8 +563,6 @@ def serve_dashboard():
         .live-pulse {
             animation: livePulse 1.5s ease-in-out infinite;
         }
-        /* Hide Leaflet attribution for clean look */
-        .leaflet-control-attribution { display: none !important; }
     </style>
 </head>
 
@@ -513,6 +597,15 @@ def serve_dashboard():
         <button onclick="switchTab('nlg')" id="btn-tab-nlg" class="px-5 py-2 border-b-2 border-transparent text-slate-500 hover:text-white font-semibold text-xs rounded-t-lg transition">2. State Explainer</button>
     </div>
 
+    <!-- ═══════════════════ RECOMMENDED ACTION — computed from real, already-existing risk/TTC data ═══════════════════ -->
+    <div id="recommendation-banner" class="glass-card px-5 py-3 mb-5 flex items-center gap-4 border-l-4" style="border-left-color:#10b981;">
+        <span id="rec-icon" class="text-2xl">✅</span>
+        <div class="flex-1">
+            <div id="rec-action" class="text-sm font-extrabold tracking-wide text-accent">PROCEED — Path Clear</div>
+            <div id="rec-reason" class="text-[11px] text-slate-500 mt-0.5">Run HCP or select a scenario to compute a real recommendation from current agent risk data.</div>
+        </div>
+    </div>
+
     <!-- ═══════════════════ MAIN DASHBOARD TAB ═══════════════════ -->
     <div id="tab-dashboard" class="grid grid-cols-12 gap-5 tab-content">
 
@@ -539,11 +632,39 @@ def serve_dashboard():
                 </span>
             </h2>
             <div class="relative flex-1 rounded-lg overflow-hidden border border-slate-800/40">
-                <div id="leaflet-map"></div>
+                <div id="scene-map"></div>
                 <!-- HUD Status Overlay Banner -->
                 <div class="absolute top-0 left-0 right-0 z-[1000] flex items-center justify-center pointer-events-none">
                     <div class="mt-3 px-5 py-1.5 bg-slate-950/75 backdrop-blur-lg border border-cyan-500/15 rounded-full shadow-lg shadow-cyan-500/5">
-                        <span class="text-[10px] mono font-bold text-cyan-400 tracking-[0.2em] uppercase live-pulse">🛰️ LIVE GEOGRAPHIC ENVIRONMENT STREAM</span>
+                        <span class="text-[10px] mono font-bold text-cyan-400 tracking-[0.2em] uppercase live-pulse">🛰️ REAL MAP GEOMETRY · EGO-CENTRIC FRAME</span>
+                    </div>
+                </div>
+                <!-- Map Legend — colors = agent type, line style = data type -->
+                <div class="absolute bottom-3 left-3 z-[1000] pointer-events-none glass-card px-3 py-2 text-[9px] mono space-y-1.5">
+                    <div class="flex items-center gap-2">
+                        <span class="inline-block w-3 h-0.5" style="background:#10b981"></span>
+                        <span class="text-slate-400">Ego Vehicle</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="inline-block w-3 h-0.5" style="background:#f59e0b"></span>
+                        <span class="text-slate-400">Other Vehicle</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="inline-block w-3 h-0.5" style="background:#38bdf8"></span>
+                        <span class="text-slate-400">Pedestrian</span>
+                    </div>
+                    <div class="border-t border-slate-800/40 my-1"></div>
+                    <div class="flex items-center gap-2">
+                        <svg width="16" height="4"><line x1="0" y1="2" x2="16" y2="2" stroke="#94a3b8" stroke-width="1" stroke-dasharray="1,1.5"/></svg>
+                        <span class="text-slate-500">Real history</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <svg width="16" height="4"><line x1="0" y1="2" x2="16" y2="2" stroke="#94a3b8" stroke-width="2"/></svg>
+                        <span class="text-slate-500">Top prediction</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <svg width="16" height="4"><line x1="0" y1="2" x2="16" y2="2" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2.5,2"/></svg>
+                        <span class="text-slate-500">Alt. prediction</span>
                     </div>
                 </div>
             </div>
@@ -552,6 +673,8 @@ def serve_dashboard():
                 <div class="flex items-center gap-2">
                     <button onclick="togglePlayback()" id="btn-play" class="glass-card px-3 py-1.5 text-xs font-bold hover:border-accent/40 transition">Play Stream</button>
                     <button onclick="resetPlayback()" class="glass-card px-3 py-1.5 text-xs font-bold hover:border-accent/40 transition">Reset</button>
+                    <button onclick="toggleInjectMode()" id="btn-add-agent" class="glass-card px-3 py-1.5 text-xs font-bold hover:border-accent/40 transition">+ Add Agent</button>
+                    <button onclick="clearInjectedAgents()" class="glass-card px-3 py-1.5 text-xs font-bold text-slate-500 hover:border-red-500/40 hover:text-red-400 transition">Clear Injected</button>
                 </div>
                 <div class="flex items-center gap-2 text-[10px] mono text-slate-500">
                     <span>Frame:</span>
@@ -579,7 +702,7 @@ def serve_dashboard():
                             <span class="text-slate-400 flex items-center gap-1.5">
                                 <span class="w-2 h-2 bg-slate-500 rounded-full"></span> Stage 1: KFF (Kinematic)
                             </span>
-                            <span id="kff-stat" class="mono font-bold text-slate-300">74 (58%)</span>
+                            <span id="kff-stat" class="mono font-bold text-slate-300">—</span>
                         </div>
                         <div class="w-full bg-slate-900/60 h-3 rounded-full overflow-hidden">
                             <div id="kff-bar" class="bg-slate-500 h-full w-[58%] transition-all duration-500"></div>
@@ -590,7 +713,7 @@ def serve_dashboard():
                             <span class="text-slate-400 flex items-center gap-1.5">
                                 <span class="w-2 h-2 bg-secondary rounded-full"></span> Stage 2: SRF (Spatial)
                             </span>
-                            <span id="srf-stat" class="mono font-bold text-slate-300">31 (24%)</span>
+                            <span id="srf-stat" class="mono font-bold text-slate-300">—</span>
                         </div>
                         <div class="w-full bg-slate-900/60 h-3 rounded-full overflow-hidden">
                             <div id="srf-bar" class="bg-secondary h-full w-[24%] transition-all duration-500"></div>
@@ -601,7 +724,7 @@ def serve_dashboard():
                             <span class="text-slate-400 flex items-center gap-1.5">
                                 <span class="w-2 h-2 bg-accent rounded-full"></span> Stage 3: SCF (Social)
                             </span>
-                            <span id="scf-stat" class="mono font-bold text-accent">9 (7%)</span>
+                            <span id="scf-stat" class="mono font-bold text-accent">—</span>
                         </div>
                         <div class="w-full bg-slate-900/60 h-3 rounded-full overflow-hidden">
                             <div id="scf-bar" class="bg-accent h-full w-[7%] transition-all duration-500"></div>
@@ -611,15 +734,15 @@ def serve_dashboard():
 
                 <!-- Latency Dial -->
                 <div class="mt-5 flex flex-col items-center glass-card p-4">
-                    <span class="text-[9px] text-slate-500 uppercase font-bold tracking-widest mb-2">Inference Latency</span>
+                    <span class="text-[9px] text-slate-500 uppercase font-bold tracking-widest mb-2">Pruner Stage Time</span>
                     <div class="relative flex items-center justify-center w-24 h-24">
                         <svg class="w-full h-full transform -rotate-90" viewBox="0 0 36 36">
                             <path class="text-slate-800" stroke-width="3" stroke="currentColor" fill="none" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
                             <path id="dial-value" class="text-accent transition-all duration-500" stroke-dasharray="80, 100" stroke-width="3" stroke-linecap="round" stroke="currentColor" fill="none" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
                         </svg>
                         <div class="absolute flex flex-col items-center">
-                            <span id="latency-ms" class="text-xl font-black mono text-white">32.5ms</span>
-                            <span class="text-[8px] uppercase tracking-widest text-slate-500 font-semibold">Real-Time</span>
+                            <span id="latency-ms" class="text-xl font-black mono text-white">—</span>
+                            <span class="text-[8px] uppercase tracking-widest text-slate-500 font-semibold">Not measured</span>
                         </div>
                     </div>
                 </div>
@@ -629,11 +752,11 @@ def serve_dashboard():
             <div class="grid grid-cols-2 gap-2.5 border-t border-slate-800/40 pt-3">
                 <div class="glass-card p-2.5 text-center">
                     <span class="text-[9px] text-slate-500 uppercase block mb-0.5 tracking-wider font-semibold">Pruning Ratio</span>
-                    <span id="pruning-ratio" class="text-base font-black text-accent mono">76.0%</span>
+                    <span id="pruning-ratio" class="text-base font-black text-accent mono">—</span>
                 </div>
                 <div class="glass-card p-2.5 text-center">
-                    <span class="text-[9px] text-slate-500 uppercase block mb-0.5 tracking-wider font-semibold">Latency Saved</span>
-                    <span id="latency-saved" class="text-base font-black text-secondary mono">71.8%</span>
+                    <span class="text-[9px] text-slate-500 uppercase block mb-0.5 tracking-wider font-semibold">Pruner Overhead</span>
+                    <span id="latency-saved" class="text-base font-black text-secondary mono">—</span>
                 </div>
             </div>
         </div>
@@ -672,11 +795,22 @@ def serve_dashboard():
 
     <!-- ═══════════════════ SCRIPTING ═══════════════════ -->
     <script>
-        let LeafletMap = null;
-        let LeafletPaths = [];
-        let LeafletMarkers = {};   // agent_id -> Leaflet marker, so streamed frames update position rather than re-creating markers every frame
+        // Real local-geometry scene renderer (replaces the earlier Leaflet
+        // tile-map approach). nuScenes never publishes true GPS for a
+        // scenario — only positions in each map's own local coordinate
+        // system — so any attempt to drop that data onto a real-world tile
+        // basemap could only ever be an approximate guess. Rendering
+        // everything (lanes, crosswalks, agent history, predictions) in
+        // that same local ego-centric frame instead means alignment is
+        // always exact, never approximate, and there's no external tile
+        // fetch left to fail or watermark.
+        let SceneSVG = null;
+        let SceneAgentMarkers = {};   // agent_id -> SVG <circle>, so streamed frames move it instead of re-creating it
+        let currentScenarioData = null;   // last-fetched /scenario response, kept so Reset can restore original positions
         let sseSource = null;
         let currentScenarioId = "";
+        let injectedAgents = [];   // {x, y, heading_deg, speed_mps, agent_type, result} — persists across redraws for THIS scenario only
+        let injectMode = false;
 
         // ── Init ──
         window.addEventListener('load', async () => {
@@ -719,9 +853,6 @@ def serve_dashboard():
                 }
             });
 
-            if (tabName === 'dashboard' && LeafletMap) {
-                setTimeout(() => LeafletMap.invalidateSize(), 150);
-            }
         }
 
         // ── Load Scenario ──
@@ -732,19 +863,18 @@ def serve_dashboard():
             if (btnPlay) btnPlay.textContent = "Play Stream";
             const frameCounter = document.getElementById('frame-counter');
             if (frameCounter) frameCounter.textContent = "0 / 12";
-            // Clear the previous scenario's agent markers so switching
-            // scenarios doesn't leave old agents' dots on the new map.
-            if (LeafletMap) {
-                Object.values(LeafletMarkers).forEach(m => {
-                    try { LeafletMap.removeLayer(m); } catch (e) {}
-                });
-            }
-            LeafletMarkers = {};
+            // Injected agents' coordinates are only meaningful in the real
+            // scenario they were placed in — a different scenario means a
+            // different real road network, so they're cleared here rather
+            // than carried over into a frame where they'd be meaningless.
+            injectedAgents = [];
+            setInjectMode(false);
 
             try {
                 const res = await fetch(`/scenario/${s_id}`);
                 const data = await res.json();
-                initLeafletMap(data);
+                currentScenarioData = data;
+                renderSceneMap(data);
                 loadAgentFeed(data);
                 loadNLGState(s_id);
             } catch (err) {
@@ -752,30 +882,312 @@ def serve_dashboard():
             }
         }
 
-        // ── Leaflet Map — Clean dark basemap, no overlays (staging) ──
-        function initLeafletMap(data) {
-            const lat = 1.290270;
-            const lon = 103.851959;
+        // ── Scene renderer — real local map geometry, real agent history,
+        // real predicted trajectories, all in the dataset's own
+        // ego-centric metre frame. No tile basemap, no GPS approximation:
+        // everything here comes from the same coordinate system the model
+        // itself reasons in, so alignment between roads/agents/predictions
+        // is always exact. ──
+        function renderSceneMap(data) {
+            const container = document.getElementById('scene-map');
+            if (!container) return;
 
-            if (!LeafletMap) {
-                LeafletMap = L.map('leaflet-map', {
-                    attributionControl: false,
-                    zoomControl: true
-                }).setView([lat, lon], 17);
+            // Fit the view to the AGENTS' real extent (history +
+            // predictions), not the full map's lane network — a scenario
+            // where agents barely move (e.g. ego at 0.1 m/s) would
+            // otherwise get crushed to an invisible speck against a map
+            // that spans hundreds of metres. The lane/crosswalk geometry
+            // still draws in full; anything outside this cropped view is
+            // just naturally clipped by the SVG viewport, the same way a
+            // real BEV crop would be.
+            const agentPts = [];
+            (data?.history || []).forEach(hist => {
+                (hist || []).forEach(pt => { if (pt && pt.length >= 2) agentPts.push([pt[0], pt[1]]); });
+            });
+            (data?.predictions || []).forEach(agentModes => {
+                (agentModes || []).forEach(mode => {
+                    (mode || []).forEach(pt => { if (pt && pt.length >= 2) agentPts.push([pt[0], pt[1]]); });
+                });
+            });
+            if (agentPts.length === 0) return;
 
-                L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-                    maxZoom: 20,
-                    subdomains: 'abcd'
-                }).addTo(LeafletMap);
+            const xs = agentPts.map(p => p[0]);
+            const ys = agentPts.map(p => p[1]);
+            const centerX = (Math.min(...xs) + Math.max(...xs)) / 2;
+            const centerY = (Math.min(...ys) + Math.max(...ys)) / 2;
+            // Half-extent of the real agent movement, with a floor so a
+            // near-stationary scenario still shows meaningful road context
+            // around it rather than zooming in on nothing.
+            const rawHalfExtent = Math.max(
+                Math.max(...xs) - Math.min(...xs),
+                Math.max(...ys) - Math.min(...ys)
+            ) / 2;
+            const halfExtent = Math.max(rawHalfExtent, 20); // metres — floor for a sensible local crop
+            const pad = halfExtent * 0.3;
+            const vbMinX = centerX - halfExtent - pad;
+            const vbMinY = -(centerY + halfExtent + pad);   // flip Y so "forward" reads as "up" on screen
+            const vbWidth = (halfExtent + pad) * 2;
+            const vbHeight = (halfExtent + pad) * 2;
+            const toSvgY = (y) => -y;
+
+            const svgns = 'http://www.w3.org/2000/svg';
+
+            if (!SceneSVG) {
+                container.innerHTML = '';
+                SceneSVG = document.createElementNS(svgns, 'svg');
+                SceneSVG.setAttribute('width', '100%');
+                SceneSVG.setAttribute('height', '100%');
+                SceneSVG.style.background = '#0d131a';
+                container.appendChild(SceneSVG);
+            }
+            SceneSVG.setAttribute('viewBox', `${vbMinX} ${vbMinY} ${vbWidth} ${vbHeight}`);
+            SceneSVG.innerHTML = '';   // clear the previous scenario's content
+            SceneAgentMarkers = {};
+
+            const addEl = (tag, attrs) => {
+                const el = document.createElementNS(svgns, tag);
+                Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+                SceneSVG.appendChild(el);
+                return el;
+            };
+
+            // 1. Real lane centerlines + crosswalks — straight from the
+            //    dataset's own local map geometry (map_polylines), so they
+            //    share the exact frame everything else is drawn in.
+            (data?.map_polylines || []).forEach(poly => {
+                if (!poly || poly.length === 0) return;
+                const isLane = poly[0][2] === 1.0;
+                const pts = poly.map(pt => `${pt[0]},${toSvgY(pt[1])}`).join(' ');
+                if (isLane) {
+                    addEl('polyline', {
+                        points: pts, fill: 'none', stroke: '#475569',
+                        'stroke-width': 0.3,
+                    });
+                } else {
+                    addEl('polygon', {
+                        points: pts, fill: '#0ea5e930', stroke: '#0ea5e9', 'stroke-width': 0.2,
+                    });
+                }
+            });
+
+            // 2. Each agent's real recent history — dotted line (distinct
+            //    from prediction line styles, see legend) + current
+            //    position dot. Hoverable tooltip confirms which agent is
+            //    which regardless of color ambiguity at a glance.
+            (data?.history || []).forEach((hist, n) => {
+                if (!hist || hist.length === 0) return;
+                const isEgo = n === 0;
+                const agentType = data?.agent_types?.[n] || 'vehicle';
+                const color = isEgo ? '#10b981' : (agentType === 'pedestrian' ? '#38bdf8' : '#f59e0b');
+                const pts = hist.map(pt => `${pt[0]},${toSvgY(pt[1])}`).join(' ');
+                const histLine = addEl('polyline', {
+                    points: pts, fill: 'none', stroke: color, 'stroke-width': 0.35,
+                    opacity: 0.7, 'stroke-linecap': 'round', 'stroke-dasharray': '0.15,0.45',
+                });
+                const histTitle = document.createElementNS(svgns, 'title');
+                histTitle.textContent = `${isEgo ? 'Ego Vehicle' : 'Agent #' + n} · real history`;
+                histLine.appendChild(histTitle);
+
+                const last = hist[hist.length - 1];
+                const marker = addEl('circle', {
+                    cx: last[0], cy: toSvgY(last[1]), r: isEgo ? 1.4 : 1.1,
+                    fill: color, stroke: '#0d131a', 'stroke-width': 0.2,
+                });
+                const markerTitle = document.createElementNS(svgns, 'title');
+                markerTitle.textContent = isEgo ? 'Ego Vehicle' : `Agent #${n} (${agentType})`;
+                marker.appendChild(markerTitle);
+                SceneAgentMarkers[n] = marker;
+            });
+
+            // 3. Real predicted trajectories — top-confidence mode
+            //    solid/thick, other candidate modes dashed (longer dashes
+            //    than the dotted history line above, so the two never look
+            //    alike), showing genuine model uncertainty across multiple
+            //    possible futures.
+            const preds = data?.predictions || [];
+            const confs = data?.confidences || [];
+            preds.forEach((agentModes, n) => {
+                if (!Array.isArray(agentModes) || agentModes.length === 0) return;
+                const isEgo = n === 0;
+                const agentType = data?.agent_types?.[n] || 'vehicle';
+                const baseColor = isEgo ? '#10b981' : (agentType === 'pedestrian' ? '#38bdf8' : '#f59e0b');
+                const agentConfs = confs[n] || [];
+                const bestIdx = agentConfs.length > 0 ? agentConfs.indexOf(Math.max(...agentConfs)) : 0;
+
+                agentModes.forEach((mode, k) => {
+                    if (!Array.isArray(mode) || mode.length === 0) return;
+                    const isBest = k === bestIdx;
+                    const pts = mode.map(pt => `${pt[0]},${toSvgY(pt[1])}`).join(' ');
+                    const line = addEl('polyline', {
+                        points: pts, fill: 'none', stroke: baseColor,
+                        'stroke-width': isBest ? 0.6 : 0.2,
+                        opacity: isBest ? 0.95 : 0.4,
+                    });
+                    if (!isBest) line.setAttribute('stroke-dasharray', '1.5,1.2');
+                    if (isBest) {
+                        const confPct = ((agentConfs[k] || 0) * 100).toFixed(0);
+                        const title = document.createElementNS(svgns, 'title');
+                        title.textContent = `${isEgo ? 'Ego' : 'Agent #' + n} · most likely path (${confPct}% confidence)`;
+                        line.appendChild(title);
+                    }
+                });
+            });
+
+            // 4. Re-draw any injected (synthetic) agents so they persist
+            //    across redraws of this scenario (e.g. after Reset).
+            injectedAgents.forEach(entry => drawInjectedAgent(entry));
+        }
+
+        // ── Add Agent — click-to-place synthetic agent, predicted via real
+        // physics-based extrapolation + the real HCP pruner (see
+        // /inject_agent/{s_id} in main.py for what this actually runs —
+        // NOT the trained transformer). ──
+        function setInjectMode(on) {
+            injectMode = on;
+            const btn = document.getElementById('btn-add-agent');
+            const mapEl = document.getElementById('scene-map');
+            if (btn) {
+                btn.textContent = on ? 'Click map to place…' : '+ Add Agent';
+                btn.classList.toggle('border-accent', on);
+                btn.classList.toggle('text-accent', on);
+            }
+            if (mapEl) mapEl.style.cursor = on ? 'crosshair' : 'default';
+        }
+        function toggleInjectMode() { setInjectMode(!injectMode); }
+
+        // Click handler — converts a screen click into this scenario's real
+        // local (x, y) using the SVG's own coordinate transform, so it's
+        // exact regardless of zoom/pan/container size.
+        document.addEventListener('DOMContentLoaded', () => {
+            const mapEl = document.getElementById('scene-map');
+            if (!mapEl) return;
+            mapEl.addEventListener('click', (evt) => {
+                if (!injectMode || !SceneSVG) return;
+                const pt = SceneSVG.createSVGPoint();
+                pt.x = evt.clientX;
+                pt.y = evt.clientY;
+                const svgPt = pt.matrixTransform(SceneSVG.getScreenCTM().inverse());
+                const realX = svgPt.x;
+                const realY = -svgPt.y;   // undo the Y-flip used for rendering
+                openInjectForm(realX, realY, evt.clientX, evt.clientY);
+                setInjectMode(false);
+            });
+        });
+
+        // Small floating form for speed/heading/type — appears at the click
+        // point, real x/y already captured from the click itself.
+        function openInjectForm(realX, realY, clientX, clientY) {
+            const existing = document.getElementById('inject-form');
+            if (existing) existing.remove();
+
+            const form = document.createElement('div');
+            form.id = 'inject-form';
+            form.className = 'glass-card p-3 text-xs space-y-2';
+            form.style.position = 'fixed';
+            form.style.left = `${Math.min(clientX + 10, window.innerWidth - 220)}px`;
+            form.style.top = `${Math.min(clientY + 10, window.innerHeight - 220)}px`;
+            form.style.zIndex = 2000;
+            form.style.width = '200px';
+            form.innerHTML = `
+                <div class="font-bold text-slate-300 mb-1">New Agent</div>
+                <label class="block text-slate-500">Type</label>
+                <select id="inj-type" class="w-full bg-slate-900/80 border border-slate-700/60 rounded px-2 py-1 mono text-[11px]">
+                    <option value="vehicle">Vehicle</option>
+                    <option value="pedestrian">Pedestrian</option>
+                </select>
+                <label class="block text-slate-500 mt-1">Speed (m/s)</label>
+                <input id="inj-speed" type="number" value="5" step="0.5" min="0" class="w-full bg-slate-900/80 border border-slate-700/60 rounded px-2 py-1 mono text-[11px]" />
+                <label class="block text-slate-500 mt-1">Heading (°, 0 = +x)</label>
+                <input id="inj-heading" type="number" value="0" step="15" class="w-full bg-slate-900/80 border border-slate-700/60 rounded px-2 py-1 mono text-[11px]" />
+                <div class="flex gap-2 mt-2">
+                    <button id="inj-confirm" class="flex-1 bg-accent hover:bg-emerald-600 text-darkbg font-bold px-2 py-1.5 rounded text-[11px]">Add</button>
+                    <button id="inj-cancel" class="flex-1 glass-card px-2 py-1.5 text-[11px] hover:border-red-500/40">Cancel</button>
+                </div>
+            `;
+            document.body.appendChild(form);
+
+            document.getElementById('inj-cancel').onclick = () => form.remove();
+            document.getElementById('inj-confirm').onclick = async () => {
+                const agent_type = document.getElementById('inj-type').value;
+                const speed_mps = parseFloat(document.getElementById('inj-speed').value) || 0;
+                const heading_deg = parseFloat(document.getElementById('inj-heading').value) || 0;
+                form.remove();
+                await confirmInjectAgent(realX, realY, heading_deg, speed_mps, agent_type);
+            };
+        }
+
+        async function confirmInjectAgent(x, y, heading_deg, speed_mps, agent_type) {
+            try {
+                const res = await fetch(`/inject_agent/${currentScenarioId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ x, y, heading_deg, speed_mps, agent_type }),
+                });
+                if (!res.ok) {
+                    console.warn('Agent injection failed:', await res.text());
+                    return;
+                }
+                const result = await res.json();
+                const entry = { x, y, heading_deg, speed_mps, agent_type, result };
+                injectedAgents.push(entry);
+                drawInjectedAgent(entry);
+            } catch (err) {
+                console.warn('Agent injection request failed:', err);
+            }
+        }
+
+        // Draws one injected agent: a distinct dashed-outline marker (never
+        // styled like a real agent's solid marker) + its real per-candidate
+        // pruner verdict — feasible candidates solid, rejected candidates
+        // thin/red, so the pruner's actual decision is visible, not just
+        // asserted.
+        function drawInjectedAgent(entry) {
+            if (!SceneSVG) return;
+            const svgns = 'http://www.w3.org/2000/svg';
+            const toSvgY = (y) => -y;
+            const addEl = (tag, attrs) => {
+                const el = document.createElementNS(svgns, tag);
+                Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+                SceneSVG.appendChild(el);
+                return el;
+            };
+
+            const color = entry.agent_type === 'pedestrian' ? '#38bdf8' : '#f59e0b';
+            const r = entry.result;
+
+            if (r && Array.isArray(r.candidates)) {
+                r.candidates.forEach((path, k) => {
+                    const feasible = r.survived ? r.survived[k] : true;
+                    const pts = path.map(([px, py]) => `${px},${toSvgY(py)}`).join(' ');
+                    const line = addEl('polyline', {
+                        points: pts, fill: 'none',
+                        stroke: feasible ? color : '#ef4444',
+                        'stroke-width': feasible ? 0.5 : 0.2,
+                        opacity: feasible ? 0.9 : 0.4,
+                    });
+                    if (!feasible) line.setAttribute('stroke-dasharray', '1.5,1.2');
+                    const title = document.createElementNS(svgns, 'title');
+                    const label = (r.labels && r.labels[k]) || `Candidate ${k}`;
+                    title.textContent = `Injected agent · ${label} · ${feasible ? 'FEASIBLE (real HCP verdict)' : 'REJECTED by HCP'}`;
+                    line.appendChild(title);
+                });
             }
 
-            // Clear any existing overlays
-            LeafletPaths.forEach(p => { try { LeafletMap.removeLayer(p); } catch(e) {} });
-            LeafletPaths = [];
+            // Distinct dashed-outline marker (never a solid dot like real
+            // agents) so an injected agent can never be visually confused
+            // with a real, dataset-sourced one.
+            const marker = addEl('circle', {
+                cx: entry.x, cy: toSvgY(entry.y), r: 1.3,
+                fill: 'none', stroke: color, 'stroke-width': 0.4, 'stroke-dasharray': '0.4,0.3',
+            });
+            const markerTitle = document.createElementNS(svgns, 'title');
+            markerTitle.textContent = `Injected ${entry.agent_type} · ${entry.speed_mps} m/s @ ${entry.heading_deg}°`;
+            marker.appendChild(markerTitle);
+        }
 
-            // STAGING: Base real-world street map loads in isolation.
-            // Trajectory overlays omitted until team verifies spatial environment.
-            LeafletMap.setView([lat, lon], 17);
+        function clearInjectedAgents() {
+            injectedAgents = [];
+            if (currentScenarioData) renderSceneMap(currentScenarioData);
         }
 
         // ── Agent Intelligence Feed ──
@@ -852,10 +1264,58 @@ def serve_dashboard():
                     tbody.appendChild(tr);
                 });
 
+                updateRecommendationBanner(states);
+
                 const dirImg = document.getElementById('direction-field-img');
                 if (dirImg) dirImg.src = `/map/${s_id}`;
             } catch (err) {
                 console.warn('NLG load failed:', err);
+            }
+        }
+
+        // ── Recommended Action — a real decision synthesized from the
+        // model's own already-computed risk_level/ttc_seconds per agent
+        // (the same data driving the State Explainer table above). Not a
+        // new signal, not fabricated — just the single highest-priority
+        // real finding surfaced where it's actually useful at a glance.
+        function updateRecommendationBanner(states) {
+            const iconEl = document.getElementById('rec-icon');
+            const actionEl = document.getElementById('rec-action');
+            const reasonEl = document.getElementById('rec-reason');
+            const bannerEl = document.getElementById('recommendation-banner');
+            if (!actionEl || !reasonEl || !bannerEl) return;
+
+            const relevant = (states || []).filter(s => s && s.agent_id !== 0); // exclude ego from its own risk assessment
+            const priority = { high: 2, medium: 1, low: 0 };
+            let worst = null;
+            relevant.forEach(s => {
+                if (!worst || (priority[s.risk_level] ?? 0) > (priority[worst.risk_level] ?? 0)) {
+                    worst = s;
+                }
+            });
+
+            if (worst && worst.risk_level === 'high') {
+                iconEl.textContent = '⛔';
+                actionEl.textContent = 'YIELD / BRAKE';
+                actionEl.className = 'text-sm font-extrabold tracking-wide text-red-400';
+                bannerEl.style.borderLeftColor = '#ef4444';
+                reasonEl.textContent = `Agent #${worst.agent_id} — ${worst.explanation || 'high collision risk'}` +
+                    (worst.ttc_seconds > 0 ? ` (TTC ${worst.ttc_seconds.toFixed(1)}s)` : '');
+            } else if (worst && worst.risk_level === 'medium') {
+                iconEl.textContent = '⚠️';
+                actionEl.textContent = 'PROCEED WITH CAUTION';
+                actionEl.className = 'text-sm font-extrabold tracking-wide text-orange-400';
+                bannerEl.style.borderLeftColor = '#f97316';
+                reasonEl.textContent = `Agent #${worst.agent_id} — ${worst.explanation || 'moderate risk detected'}` +
+                    (worst.ttc_seconds > 0 ? ` (TTC ${worst.ttc_seconds.toFixed(1)}s)` : '');
+            } else {
+                iconEl.textContent = '✅';
+                actionEl.textContent = 'PROCEED — Path Clear';
+                actionEl.className = 'text-sm font-extrabold tracking-wide text-accent';
+                bannerEl.style.borderLeftColor = '#10b981';
+                reasonEl.textContent = relevant.length > 0
+                    ? `No agent currently at elevated risk (${relevant.length} tracked).`
+                    : 'No other agents in this scenario.';
             }
         }
 
@@ -879,10 +1339,13 @@ def serve_dashboard():
                 updateWidth('scf-bar', `${Math.round(stats.scf_count / stats.raw_count * 100)}%`);
                 update('latency-ms', `${stats.total_time_ms.toFixed(1)}ms`);
                 update('pruning-ratio', `${(stats.pruning_ratio * 100).toFixed(1)}%`);
-                update('latency-saved', `${stats.latency_reduction_pct.toFixed(1)}%`);
+                // pruner.py deliberately stopped reporting latency_reduction_pct:
+                // masking does not skip any decoder computation, so there is no
+                // reduction to report. Show the pruner's own measured cost.
+                update('latency-saved', `${stats.total_time_ms.toFixed(1)}ms`);
 
                 // Success flash on map
-                const mapEl = document.getElementById('leaflet-map');
+                const mapEl = document.getElementById('scene-map');
                 if (mapEl) {
                     const flash = document.createElement('div');
                     flash.className = "absolute bottom-4 right-4 z-[1001] bg-accent/90 text-darkbg font-extrabold px-4 py-2 rounded-lg text-xs shadow-lg";
@@ -908,32 +1371,37 @@ def serve_dashboard():
                         const fc = document.getElementById('frame-counter');
                         if (fc) fc.textContent = `${(data?.step ?? 0) + 1} / 12`;
 
-                        // Draw/update each agent's real predicted position on the map.
-                        // Previously this handler only updated the frame counter text
-                        // and never touched the map at all — the stream's real data
-                        // was being received correctly but silently discarded.
-                        if (LeafletMap && data && Array.isArray(data.agents)) {
+                        // Move each agent's real streamed position on the
+                        // scene map — using the stream's real ego-centric
+                        // x/y (same frame as everything else drawn here),
+                        // not the earlier approximate lat/lng conversion.
+                        if (SceneSVG && data && Array.isArray(data.agents)) {
+                            const svgns = 'http://www.w3.org/2000/svg';
                             data.agents.forEach(agent => {
-                                if (typeof agent.lat !== 'number' || typeof agent.lng !== 'number') return;
-                                const isEgo = agent.agent_id === 0;
-                                const color = isEgo ? '#10b981' /* emerald, matches Ego Vehicle styling */
-                                            : agent.type === 'pedestrian' ? '#38bdf8' /* sky blue */
-                                            : '#f59e0b' /* amber, other vehicles */;
-
-                                if (LeafletMarkers[agent.agent_id]) {
+                                if (typeof agent.x !== 'number' || typeof agent.y !== 'number') return;
+                                const svgY = -agent.y;
+                                if (SceneAgentMarkers[agent.agent_id]) {
                                     // Marker already exists for this agent — just move it.
-                                    LeafletMarkers[agent.agent_id].setLatLng([agent.lat, agent.lng]);
+                                    SceneAgentMarkers[agent.agent_id].setAttribute('cx', agent.x);
+                                    SceneAgentMarkers[agent.agent_id].setAttribute('cy', svgY);
                                 } else {
                                     // First frame for this agent — create its marker.
-                                    LeafletMarkers[agent.agent_id] = L.circleMarker([agent.lat, agent.lng], {
-                                        radius: isEgo ? 9 : 7,
-                                        color: color,
-                                        fillColor: color,
-                                        fillOpacity: 0.9,
-                                        weight: 2,
-                                    }).addTo(LeafletMap)
-                                      .bindTooltip(isEgo ? 'Ego Vehicle' : `Agent #${agent.agent_id} (${agent.type})`,
-                                                   { permanent: false, direction: 'top' });
+                                    const isEgo = agent.agent_id === 0;
+                                    const color = isEgo ? '#10b981' /* emerald, matches Ego Vehicle styling */
+                                                : agent.type === 'pedestrian' ? '#38bdf8' /* sky blue */
+                                                : '#f59e0b' /* amber, other vehicles */;
+                                    const marker = document.createElementNS(svgns, 'circle');
+                                    marker.setAttribute('cx', agent.x);
+                                    marker.setAttribute('cy', svgY);
+                                    marker.setAttribute('r', isEgo ? 1.4 : 1.1);
+                                    marker.setAttribute('fill', color);
+                                    marker.setAttribute('stroke', '#0d131a');
+                                    marker.setAttribute('stroke-width', '0.2');
+                                    const title = document.createElementNS(svgns, 'title');
+                                    title.textContent = isEgo ? 'Ego Vehicle' : `Agent #${agent.agent_id} (${agent.type})`;
+                                    marker.appendChild(title);
+                                    SceneSVG.appendChild(marker);
+                                    SceneAgentMarkers[agent.agent_id] = marker;
                                 }
                             });
                         }
@@ -956,14 +1424,12 @@ def serve_dashboard():
             if (btn) btn.textContent = "Play Stream";
             const fc = document.getElementById('frame-counter');
             if (fc) fc.textContent = "0 / 12";
-            // Clear agent markers left over from the previous playback so a
-            // fresh run (or a different scenario) doesn't show stale dots.
-            if (LeafletMap) {
-                Object.values(LeafletMarkers).forEach(m => {
-                    try { LeafletMap.removeLayer(m); } catch (e) {}
-                });
+            // Re-render the static scene from the current scenario's real
+            // data — restores every agent to its real starting position
+            // and clears any drift left over from streamed playback.
+            if (currentScenarioData) {
+                renderSceneMap(currentScenarioData);
             }
-            LeafletMarkers = {};
         }
     </script>
 </body>

@@ -34,8 +34,14 @@ from hcp_project.mtr_core.encoder import MTREncoder
 from hcp_project.fusion.fusion import CrossAttentionFusionLayer
 from hcp_project.mtr_core.decoder import MTRDecoder
 from hcp_project.mtr_core.image_encoder import ImageEncoder
-from hcp_project.hcp.pruner import HierarchicalCombinatorialPruner, generate_kinematic_candidates
+from hcp_project.hcp.pruner import (
+    HierarchicalCombinatorialPruner, generate_kinematic_candidates,
+    generate_anchor_candidates,
+)
 from hcp_project.utils.mixed_precision import ScaleTrainingManager
+from hcp_project.utils.geometry import (
+    build_agent_features, build_agent_frames, local_to_scene, AGENT_FEATURE_DIM,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -43,14 +49,22 @@ from hcp_project.utils.mixed_precision import ScaleTrainingManager
 # ---------------------------------------------------------------------------
 
 class MTRMotionTransformer(nn.Module):
-    def __init__(self, d_model: int = 256, n_modes: int = 6, T_fut: int = 12,
-                 use_image: bool = True, pretrained_image: bool = True):
+    def __init__(self, d_model: int = 256, n_modes: int = None, T_fut: int = 12,
+                 use_image: bool = True, pretrained_image: bool = True,
+                 anchors=None):
         super().__init__()
         self.map_tokenizer   = MapTokenizer(in_channels=3,  d_model=d_model)
-        self.agent_tokenizer = AgentTokenizer(in_channels=6, d_model=d_model)
+        # 9 channels, not 6: the agent's motion in its OWN frame (5) + type (1)
+        # + its scene-frame pose (3). See utils/geometry.build_agent_features.
+        self.agent_tokenizer = AgentTokenizer(in_channels=AGENT_FEATURE_DIM, d_model=d_model)
         self.encoder         = MTREncoder(d_model=d_model, nhead=8, num_layers=4)
         self.fusion          = CrossAttentionFusionLayer(d_model=d_model, nhead=8)
-        self.decoder         = MTRDecoder(d_model=d_model, n_modes=n_modes, T_fut=T_fut)
+        # anchors=None -> the decoder's built-in bank. Pass a (K, 2) array from
+        # tools/compute_anchors.py to use data-derived anchors and a larger K.
+        self.decoder         = MTRDecoder(d_model=d_model,
+                                          n_modes=None if anchors is not None else n_modes,
+                                          T_fut=T_fut, anchors=anchors)
+        self.n_modes         = self.decoder.n_modes
 
         # Optional CAM_FRONT image branch. Backbone stays frozen (see
         # ImageEncoder docstring) — only its projection head trains, since
@@ -83,8 +97,20 @@ class MTRMotionTransformer(nn.Module):
         B, N, T_hist, _ = history_traj.shape
         device = history_traj.device
 
+        # 0. Per-agent local frames ---------------------------------------------
+        # Everything arriving here is in the EGO frame, so an agent can be tens of
+        # metres from the origin at any heading -- while the decoder's intention
+        # anchors ((40,0), (25,15), ...) only mean anything relative to the agent
+        # itself. We therefore predict in each agent's own frame and map back at
+        # the end. See utils/geometry for the full rationale.
+        agent_origin, agent_theta = build_agent_frames(history_traj)   # (B,N,2), (B,N)
+
         # 1. Tokenise agent histories -------------------------------------------
-        flat_hist   = history_traj.view(B * N, T_hist, -1)
+        # Features are the agent's motion expressed locally, plus its scene-frame
+        # pose so the encoder can still tell agents apart and reason about who is
+        # near whom.
+        agent_feats = build_agent_features(history_traj)   # (B, N, T_hist, 9)
+        flat_hist   = agent_feats.view(B * N, T_hist, -1)
         agent_tokens = self.agent_tokenizer(flat_hist)   # (B*N, d_model)
         agent_tokens = agent_tokens.view(B, N, -1)        # (B, N, d_model)
 
@@ -137,24 +163,109 @@ class MTRMotionTransformer(nn.Module):
         fused_map  = self.fusion(map_tokens, agent_context, distances)  # (B, M, d_model)
 
         # 5. Decode --------------------------------------------------------------
-        traj_out, confidences = self.decoder(agent_context, fused_map, hcp_mask)
+        # The decoder emits LOCAL displacement, where the intention anchors are
+        # meaningful and the numbers the network has to produce stay small.
+        traj_local, confidences = self.decoder(agent_context, fused_map, hcp_mask)
+
+        # 6. Back to scene frame --------------------------------------------------
+        # A fixed rigid transform, so gradients pass through unchanged. Returning
+        # scene-frame trajectories keeps evaluate.py, the pruner and the dashboard
+        # working in the single shared frame they already assume. minADE/minFDE are
+        # invariant under this transform, so the metric itself does not move -- only
+        # the model's ability to hit it.
+        traj_out = local_to_scene(traj_local, agent_origin, agent_theta)
 
         return traj_out, confidences
+
+
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint loading
+# ---------------------------------------------------------------------------
+
+def load_state_dict_forgiving(model, state_dict, context: str = ""):
+    """Load weights, skipping entries whose shape no longer matches.
+
+    ``load_state_dict(strict=False)`` tolerates missing and unexpected KEYS but
+    still raises on a SHAPE mismatch, which produces a wall of size-mismatch
+    lines that do not say what to do about it.
+
+    One such mismatch is expected right now: the agent tokenizer's input width
+    changed from 6 to 9 channels when per-agent coordinate normalisation was
+    introduced (utils/geometry.build_agent_features). Any checkpoint saved
+    before that change carries the 6-channel weights. Those weights were also
+    trained to map ego-frame absolute positions onto anchors that assumed an
+    agent-centric frame, so they are not worth salvaging even where they would
+    fit -- a fresh run is the intended path.
+
+    Returns (missing, unexpected, skipped) so the caller can report honestly.
+    """
+    model_sd = model.state_dict()
+    skipped = []
+    filtered = {}
+    for k, v in state_dict.items():
+        if k in model_sd and hasattr(v, "shape") and model_sd[k].shape != v.shape:
+            skipped.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+        else:
+            filtered[k] = v
+
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+
+    if skipped:
+        print(f"\n{'=' * 72}")
+        print(f"WARNING: {len(skipped)} tensor(s) in this checkpoint no longer fit "
+              f"the model{(' (' + context + ')') if context else ''}:")
+        for k, ck, mk in skipped[:6]:
+            print(f"  {k}: checkpoint {ck} vs model {mk}")
+        if len(skipped) > 6:
+            print(f"  ... and {len(skipped) - 6} more")
+        print("\nThis is expected for any checkpoint saved before per-agent")
+        print("coordinate normalisation was added. Those weights encode the old")
+        print("ego-frame behaviour and the unmasked-padding loss, so resuming from")
+        print("them is not meaningful -- train from scratch instead (omit")
+        print("--resume_model). The affected layers have been left freshly")
+        print("initialised rather than aborting the run.")
+        print(f"{'=' * 72}\n")
+
+    return missing, unexpected, skipped
 
 
 # ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
 
-def compute_gmm_loss(pred_trajs, confidences, gt_trajs):
+def compute_gmm_loss(pred_trajs, confidences, gt_trajs, valid_mask=None):
     """
-    GMM Negative Log-Likelihood loss.
+    Winner-takes-all regression + mode classification loss.
 
     pred_trajs  : (B, N, K, T, 5)   x, y at indices 0, 1
-    confidences : (B, N, K)
+    confidences : (B, N, K)         softmax probabilities
     gt_trajs    : (B, N, T, 5)
+    valid_mask  : (B, N) bool -- True for real agents, False for padding.
+                  REQUIRED in practice; None means "every row is real" and is
+                  kept only for callers that genuinely have no padding.
+
+    Why valid_mask exists
+    ~~~~~~~~~~~~~~~~~~~~~
+    The training loop pads each micro-batch out to the largest agent count in
+    it, filling the extra rows with zeros. Without a mask this function averaged
+    over those rows too, so the model was explicitly trained to predict (0, 0)
+    for agents that do not exist -- while the intention anchors simultaneously
+    pushed the same head toward 40 m. Padded rows also carry an all-False HCP
+    mask, which softmaxes to a uniform 1/6 and fed a meaningless target straight
+    into the classification term.
     """
     B, N, K, T, _ = pred_trajs.shape
+
+    if valid_mask is None:
+        valid_mask = torch.ones((B, N), dtype=torch.bool, device=pred_trajs.device)
+    valid_mask = valid_mask.to(device=pred_trajs.device, dtype=torch.bool)
+
+    n_valid = valid_mask.sum()
+    if n_valid == 0:
+        zero = pred_trajs.sum() * 0.0
+        return zero, 0.0, 0.0
 
     pred_xy = pred_trajs[..., :2]
     gt_xy   = gt_trajs[..., :2].unsqueeze(2)         # (B, N, 1, T, 2)
@@ -164,19 +275,27 @@ def compute_gmm_loss(pred_trajs, confidences, gt_trajs):
 
     best_mode_idx = ade.argmin(dim=-1)                 # (B, N)
 
-    # Regression on best mode (x, y only)
+    # --- Regression on the winning mode (x, y only), real agents only ---
     best_idx_exp  = (best_mode_idx
                      .unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
                      .expand(-1, -1, -1, T, 2))
     best_pred_xy  = torch.gather(pred_xy, 2, best_idx_exp).squeeze(2)  # (B, N, T, 2)
-    reg_loss      = F.smooth_l1_loss(best_pred_xy, gt_trajs[..., :2])
 
-    # Classification (winner-takes-all CE)
-    flat_conf   = confidences.view(B * N, K)
-    flat_target = best_mode_idx.view(B * N)
-    cls_loss    = F.nll_loss(torch.log(flat_conf + 1e-8), flat_target)
+    per_elem = F.smooth_l1_loss(best_pred_xy, gt_trajs[..., :2], reduction="none")
+    # (B, N, T, 2) -> mean over T and xy, leaving one number per agent
+    per_agent_reg = per_elem.mean(dim=(-1, -2))                        # (B, N)
+    reg_loss = (per_agent_reg * valid_mask).sum() / n_valid
 
-    return reg_loss + 2.0 * cls_loss, reg_loss.item(), cls_loss.item()
+    # --- Classification (winner-takes-all), real agents only ---
+    flat_conf   = confidences.reshape(B * N, K)
+    flat_target = best_mode_idx.reshape(B * N)
+    per_agent_cls = F.nll_loss(
+        torch.log(flat_conf.clamp_min(1e-8)), flat_target, reduction="none"
+    ).view(B, N)
+    cls_loss = (per_agent_cls * valid_mask).sum() / n_valid
+
+    total = reg_loss + 2.0 * cls_loss
+    return total, reg_loss.item(), cls_loss.item()
 
 
 # ---------------------------------------------------------------------------
@@ -195,12 +314,15 @@ def _compute_loss_for_manager(model, batch_data, device):
     hcp_mask     = batch_data["hcp_mask"].to(device) if batch_data.get("hcp_mask") is not None else None
     camera_images  = batch_data.get("camera_images")
     has_image_mask = batch_data.get("has_image_mask")
+    valid_mask     = batch_data.get("valid_mask")
     if camera_images is not None:
         camera_images = camera_images.to(device)
+    if valid_mask is not None:
+        valid_mask = valid_mask.to(device)
 
     pred_trajs, confidences = model(hist_traj, map_polylines, hcp_mask,
                                      camera_images=camera_images, has_image_mask=has_image_mask)
-    return compute_gmm_loss(pred_trajs, confidences, gt_traj)
+    return compute_gmm_loss(pred_trajs, confidences, gt_traj, valid_mask=valid_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +343,10 @@ def train_model(
     lr_patience: int = 2,
     lr_factor: float = 0.5,
     override_lr: float = None,
+    use_image: bool = True,
+    n_modes: int = None,
+    anchors_path: str = None,
+    mask_in_training: bool = False,
 ):
     print("Initialising training pipeline …")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,7 +376,29 @@ def train_model(
     # -------------------------------------------------------------- model
     print("Building model (downloads ImageNet-pretrained ResNet18 weights on first "
           "run if not already cached — needs internet access)...")
-    model  = MTRMotionTransformer(d_model=256, n_modes=6).to(device)
+    # The CAM_FRONT branch is only worth its cost if real images exist. When the
+    # nuScenes blob parts have not been downloaded, every scenario falls back to
+    # a zero placeholder -- and the frozen ResNet18 then runs a full forward pass
+    # over a blank image on every step, only for the result to be multiplied by
+    # has_image_mask = 0. That is pure waste, and it also makes the first run
+    # reach out to the internet for ImageNet weights.
+    samples_dir = os.path.join(nuscenes_dir, "samples")
+    if use_image and not os.path.isdir(samples_dir):
+        print(f"\nNote: no camera images found at {samples_dir} -- no nuScenes "
+              f"sensor blob parts appear to be extracted. Disabling the image "
+              f"branch for this run (pass --use_image to force it on). This "
+              f"skips a wasted ResNet18 forward pass per step and avoids the "
+              f"ImageNet weight download.\n")
+        use_image = False
+
+    anchors = None
+    if anchors_path:
+        anchors = np.load(anchors_path)
+        print(f"Loaded {anchors.shape[0]} data-derived anchors from {anchors_path}.")
+    model  = MTRMotionTransformer(d_model=256, n_modes=n_modes, use_image=use_image,
+                                  anchors=anchors).to(device)
+    K_modes = model.decoder.n_modes
+    print(f"Decoder configured with {K_modes} intention modes.")
     print("Model built.")
     pruner = HierarchicalCombinatorialPruner().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -282,7 +430,8 @@ def train_model(
         ckpt = torch.load(resume_model, map_location=device)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             # New-style checkpoint (saved by this updated train.py)
-            missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            missing, unexpected, skipped = load_state_dict_forgiving(
+                model, ckpt["model_state_dict"], context="resume")
             if missing or unexpected:
                 print(f"Note: resumed with a checkpoint saved before the image branch "
                       f"existed (or a mismatched architecture) — {len(missing)} new "
@@ -338,7 +487,8 @@ def train_model(
             # original nuScenes-mini run) — weights only, no epoch/optimizer
             # info to restore, so we start counting epochs from 0 but keep
             # the pretrained weights instead of random init.
-            missing, unexpected = model.load_state_dict(ckpt, strict=False)
+            missing, unexpected, skipped = load_state_dict_forgiving(
+                model, ckpt, context="legacy checkpoint")
             print("Resumed model weights from a legacy (state-dict-only) "
                   "checkpoint. No epoch/optimizer info was stored in it, so "
                   "epoch counting restarts at 0, but training continues from "
@@ -390,14 +540,20 @@ def train_model(
             # NOT to a global maximum across the dataset.
             hist_padded = torch.zeros((B, N_max, T_hist, 6),  dtype=torch.float32)
             fut_padded  = torch.zeros((B, N_max, T_fut,  5),  dtype=torch.float32)
+            # True for real agents, False for the zero rows added by padding.
+            # Without this the loss trains the model to predict (0,0) for agents
+            # that do not exist -- see compute_gmm_loss.
+            valid_mask  = torch.zeros((B, N_max), dtype=torch.bool)
             cursor = 0
             for b, n in enumerate(batch_splits):
                 hist_padded[b, :n] = packed_hist[cursor:cursor + n]
                 fut_padded[b,  :n] = packed_fut[cursor:cursor + n]
+                valid_mask[b, :n]  = True
                 cursor += n
 
             hist_padded = hist_padded.to(device)
             fut_padded  = fut_padded.to(device)
+            valid_mask  = valid_mask.to(device)
 
             # ---- Camera images (one CAM_FRONT keyframe per scene) -------------
             camera_images  = collated.get("camera_images")   # (B, 3, 224, 224) or None
@@ -416,27 +572,45 @@ def train_model(
             # ---- HCP pruning mask (real kinematic candidates from history —
             # no ground truth involved, matching what's actually available
             # at real inference time) --------------------------------------
-            dense_candidates = torch.zeros((B, N_max, 6, T_fut, 5), device=device)
-            for b in range(B):
-                for n in range(batch_splits[b]):
-                    dense_candidates[b, n] = generate_kinematic_candidates(
-                        hist_padded[b, n], T_fut=T_fut, dt=0.5, K=6)
+            # ---- HCP mask ----------------------------------------------------
+            # OFF during training by default, deliberately.
+            #
+            # Two reasons. First, correctness: the loss is winner-takes-all over
+            # modes, so if pruning removes the mode closest to ground truth, the
+            # classification term is handed a target whose probability has been
+            # forced to zero. That contributes a constant ~18.4 with no gradient
+            # -- pure noise in the objective.
+            #
+            # Second, it confounds the experiment. The project asks whether
+            # pruning costs accuracy at inference. Training one model normally and
+            # then comparing HCP-on against HCP-off at inference isolates exactly
+            # that. Training with the mask entangles the two.
+            #
+            # It also makes training substantially faster: the pruner costs more
+            # per agent than the model itself, and this skips it entirely.
+            hcp_mask = None
+            if mask_in_training:
+                anchors_t = model.decoder.intention_anchors
+                dense_candidates = torch.zeros((B, N_max, K_modes, T_fut, 5), device=device)
+                for b in range(B):
+                    for n in range(batch_splits[b]):
+                        dense_candidates[b, n] = generate_anchor_candidates(
+                            hist_padded[b, n], anchors_t, T_fut=T_fut, dt=0.5)
 
-            hcp_masks = []
-            for b in range(B):
-                _, mask, _ = pruner(
-                    dense_candidates[b, :batch_splits[b]],
-                    hist_padded[b, :batch_splits[b]],
-                    map_polylines_batch[b],
-                )
-                # Pad mask to N_max
-                pad_rows = N_max - batch_splits[b]
-                if pad_rows > 0:
-                    mask = torch.cat(
-                        [mask, torch.zeros((pad_rows, 6), dtype=torch.bool, device=device)],
-                        dim=0)
-                hcp_masks.append(mask)
-            hcp_mask = torch.stack(hcp_masks)   # (B, N_max, 6)
+                hcp_masks = []
+                for b in range(B):
+                    _, mask, _ = pruner(
+                        dense_candidates[b, :batch_splits[b]],
+                        hist_padded[b, :batch_splits[b]],
+                        map_polylines_batch[b],
+                    )
+                    pad_rows = N_max - batch_splits[b]
+                    if pad_rows > 0:
+                        mask = torch.cat(
+                            [mask, torch.zeros((pad_rows, K_modes), dtype=torch.bool, device=device)],
+                            dim=0)
+                    hcp_masks.append(mask)
+                hcp_mask = torch.stack(hcp_masks)   # (B, N_max, K_modes)
 
             # ---- AMP forward + backward via ScaleTrainingManager --------------
             batch_data = {
@@ -446,6 +620,7 @@ def train_model(
                 "hcp_mask":       hcp_mask,
                 "camera_images":  camera_images,
                 "has_image_mask": has_image_mask,
+                "valid_mask":     valid_mask,
             }
             step_loss = scale_mgr.execute_step(
                 batch_data, _compute_loss_for_manager, step_idx)
@@ -604,6 +779,29 @@ if __name__ == "__main__":
                              "bug fix or other change invalidates the old plateau "
                              "history, so the model gets real room to adapt rather "
                              "than crawling at an already-decayed-down LR.")
+    parser.add_argument("--mask_in_training", action="store_true",
+                        help="Apply the HCP mask during training too. Off by default: "
+                             "it injects a gradient-free constant into the winner-takes-all "
+                             "loss whenever pruning removes the best mode, it confounds the "
+                             "HCP-on vs HCP-off comparison, and it makes every step pay the "
+                             "pruner's cost for no benefit.")
+    parser.add_argument("--n_modes", type=int, default=None,
+                        help="Number of intention modes when no --anchors file is given. "
+                             "Capped by the decoder's built-in anchor bank; use "
+                             "tools/compute_anchors.py for larger K.")
+    parser.add_argument("--anchors", type=str, default=None,
+                        help="Path to a (K, 2) .npy anchor bank from "
+                             "tools/compute_anchors.py. Raising K is what makes HCP "
+                             "pruning able to save meaningful compute -- at K=6 only "
+                             "~24%% of inference depends on K at all.")
+    img = parser.add_mutually_exclusive_group()
+    img.add_argument("--use_image", dest="use_image", action="store_true", default=None,
+                     help="Force the CAM_FRONT image branch ON. Only useful once "
+                          "nuScenes sensor blob parts are extracted; without them "
+                          "every image is a zero placeholder and the branch is "
+                          "auto-disabled.")
+    img.add_argument("--no_image", dest="use_image", action="store_false",
+                     help="Force the CAM_FRONT image branch OFF, even if images exist.")
     args = parser.parse_args()
 
     train_model(
@@ -620,4 +818,8 @@ if __name__ == "__main__":
         lr_patience=args.lr_patience,
         lr_factor=args.lr_factor,
         override_lr=args.override_lr,
+        use_image=True if args.use_image is None else args.use_image,
+        n_modes=args.n_modes,
+        anchors_path=args.anchors,
+        mask_in_training=args.mask_in_training,
     )

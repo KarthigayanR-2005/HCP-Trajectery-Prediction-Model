@@ -61,6 +61,9 @@ class LargeScaleDrivingStreamer(IterableDataset):
         self.parser         = parser_instance
         self.shuffle        = shuffle
         self.seed           = seed
+        # Incremented per __iter__ so successive epochs draw a different
+        # permutation instead of repeating the same order every epoch.
+        self._epoch         = 0
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -70,28 +73,66 @@ class LargeScaleDrivingStreamer(IterableDataset):
     def __iter__(self):
         """
         Yield one scenario dictionary per call.  Worker info is used to
-        shard the index list so each DataLoader worker processes a disjoint
+        shard the scenario list so each DataLoader worker processes a disjoint
         subset.
+
+        Two bugs were fixed here; both silently corrupted every training run
+        made before this change.
+
+        1. SHARD BEFORE SHUFFLE.  The old code shuffled with a per-worker seed
+           (``self.seed + worker_info.id``) and only THEN sliced
+           ``[worker_id::num_workers]``.  Because each worker shuffled a
+           *different* permutation before slicing, the shards were not
+           disjoint: some scenarios were delivered by several workers in the
+           same epoch and others by none.  With the default num_workers=2,
+           roughly a quarter of the dataset was skipped each epoch while
+           another quarter was double-weighted.  Sharding the ordered list
+           first and shuffling only within the shard makes the partition exact
+           for any worker count, while still giving a different order each
+           epoch.
+
+        2. RESOLVE THE SCENARIO ID.  The old code yielded ``self._load(i)``
+           where ``i`` was a *position* in ``self.scenarios``, and ``_load``
+           passed it straight to ``parser[...]``.  That happened to work only
+           because callers passed ``list(range(len(dataset)))``, making
+           position and value identical.  Passing any subset — which is exactly
+           what a held-out train/val split requires — would have silently
+           trained on dataset positions 0..N-1 instead of the requested
+           scenarios.  We now index ``self.scenarios`` to get the real ID.
         """
         worker_info = torch.utils.data.get_worker_info()
-        indices     = list(range(len(self.scenarios)))
 
+        # 1. Partition the ORDERED list first, so shards are always disjoint.
+        positions = list(range(len(self.scenarios)))
+        if worker_info is not None:
+            positions = positions[worker_info.id :: worker_info.num_workers]
+
+        # 2. Shuffle only within this worker's shard.  The epoch counter keeps
+        #    the order varying between epochs; the worker id keeps workers from
+        #    drawing the same permutation, which is harmless now that the
+        #    shards no longer overlap.
         if self.shuffle:
             rng = np.random.default_rng(
-                self.seed + (worker_info.id if worker_info else 0))
-            rng.shuffle(indices)
+                self.seed
+                + 1000 * self._epoch
+                + (worker_info.id if worker_info else 0))
+            rng.shuffle(positions)
 
-        if worker_info is not None:
-            # Slice indices for this worker
-            indices = indices[worker_info.id :: worker_info.num_workers]
+        self._epoch += 1
 
-        for idx in indices:
-            yield self._load(idx)
+        for pos in positions:
+            # Resolve position -> the scenario ID the caller actually asked for.
+            yield self._load(self.scenarios[pos])
 
     # ------------------------------------------------------------------
-    def _load(self, idx: int) -> Dict[str, Any]:
+    def _load(self, scenario_id) -> Dict[str, Any]:
         """Load one scenario, converting to tensors.  Returns a placeholder
-        dict on any error so the epoch is never aborted."""
+        dict on any error so the epoch is never aborted.
+
+        ``scenario_id`` is an entry of ``self.scenarios`` (whatever the caller
+        passed in), NOT a position within that list — see __iter__.
+        """
+        idx = scenario_id
         try:
             batch = self.parser[idx]
 

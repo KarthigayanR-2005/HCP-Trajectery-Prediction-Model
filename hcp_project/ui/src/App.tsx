@@ -26,14 +26,22 @@ interface AgentState {
   explanation: string;
 }
 
+// Mirrors the stats dict returned by HierarchicalCombinatorialPruner.forward().
+// NOTE: latency_reduction_pct and accuracy_retention_pct were deliberately
+// removed from that dict — they were hardcoded placeholders that were never
+// measured, and the decoder currently evaluates every mode regardless of the
+// pruning mask, so there is no latency reduction to report. Do not re-add them
+// here without a real measurement behind them.
 interface HCPStats {
   raw_count: number;
   kff_count: number;
   srf_count: number;
   scf_count: number;
   total_time_ms: number;
+  kff_time_ms: number;
+  srf_time_ms: number;
+  scf_time_ms: number;
   pruning_ratio: number;
-  latency_reduction_pct: number;
 }
 
 interface ScenarioData {
@@ -349,10 +357,9 @@ export default function App() {
   const [scenarios, setScenarios] = useState<string[]>([]);
   const [agents, setAgents] = useState<AgentState[]>([]);
   const [scenarioData, setScenarioData] = useState<ScenarioData | null>(null);
-  const [hcp, setHcp] = useState<HCPStats>({
-    raw_count: 128, kff_count: 74, srf_count: 31, scf_count: 9,
-    total_time_ms: 32.5, pruning_ratio: 0.76, latency_reduction_pct: 71.8,
-  });
+  // Starts null rather than pre-filled with invented numbers: the panel shows
+  // an empty state until the backend returns a real measurement.
+  const [hcp, setHcp] = useState<HCPStats | null>(null);
   const [isLiveData, setIsLiveData] = useState(false);
   const [isHcpLive, setIsHcpLive] = useState(false);
   const [backendOnline, setBackendOnline] = useState(false);
@@ -525,7 +532,9 @@ export default function App() {
         }
       })
       .catch(() => {
-        setHcp({ raw_count: 128, kff_count: 70, srf_count: 28, scf_count: 8, total_time_ms: 31.8, pruning_ratio: 0.78, latency_reduction_pct: 72.4 });
+        // Previously substituted a fabricated stats object here. Clearing to
+        // null instead keeps the "no data" state honest.
+        setHcp(null);
         setIsHcpLive(false);
       });
   }, [scenarioId]);
@@ -874,11 +883,11 @@ export default function App() {
                       ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400'
                       : 'bg-amber-500/10 border-amber-500/20 text-amber-400'
                   }`}>
-                    {isHcpLive ? 'LIVE' : 'MOCK'}
+                    {isHcpLive ? 'LIVE' : 'NO DATA'}
                   </span>
                 </div>
                 <div className="space-y-3 flex-1">
-                  <PruneBar label="Raw Candidates" value={hcp?.raw_count ?? 128} total={hcp?.raw_count ?? 128} color="bg-slate-500" dotColor="bg-slate-500" />
+                  <PruneBar label="Raw Candidates" value={hcp?.raw_count ?? 0} total={hcp?.raw_count || 1} color="bg-slate-500" dotColor="bg-slate-500" />
                   <PruneBar label="KFF · Kinematic" value={hcp?.kff_count ?? 0} total={hcp?.raw_count || 1} color="bg-slate-400" dotColor="bg-slate-400" />
                   <PruneBar label="SRF · Spatial" value={hcp?.srf_count ?? 0} total={hcp?.raw_count || 1} color="bg-sky-500" dotColor="bg-sky-500" />
                   <PruneBar label="SCF · Social" value={hcp?.scf_count ?? 0} total={hcp?.raw_count || 1} color="bg-emerald-500" dotColor="bg-emerald-500" />
@@ -892,7 +901,7 @@ export default function App() {
                       <circle
                         cx="18" cy="18" r="15.9" fill="none"
                         stroke="url(#grad)" strokeWidth="2.5" strokeLinecap="round"
-                        strokeDasharray={`${Math.min(((hcp?.total_time_ms ?? 32.5) / 120) * 100, 100)}, 100`}
+                        strokeDasharray={`${Math.min(((hcp?.total_time_ms ?? 0) / 120) * 100, 100)}, 100`}
                         className="transition-all duration-700"
                       />
                       <defs>
@@ -907,7 +916,7 @@ export default function App() {
                     </div>
                   </div>
                   <div>
-                    <div className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Latency</div>
+                    <div className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Pruner Stage</div>
                     <div className="text-sm font-bold font-mono text-white">{(hcp?.total_time_ms ?? 0).toFixed(1)}ms</div>
                   </div>
                 </div>
@@ -925,9 +934,9 @@ export default function App() {
                 <Glass className="p-3 text-center">
                   <Timer className="w-4 h-4 text-sky-400 mx-auto mb-1" />
                   <div className="text-lg font-black font-mono bg-gradient-to-r from-sky-400 to-violet-400 bg-clip-text text-transparent">
-                    {(hcp?.latency_reduction_pct ?? 0).toFixed(0)}%
+                    {hcp ? `${hcp.total_time_ms.toFixed(1)}ms` : '\u2014'}
                   </div>
-                  <div className="text-[8px] text-slate-500 uppercase tracking-widest font-semibold mt-0.5">Faster</div>
+                  <div className="text-[8px] text-slate-500 uppercase tracking-widest font-semibold mt-0.5">Pruner Cost</div>
                 </Glass>
               </div>
             </div>
